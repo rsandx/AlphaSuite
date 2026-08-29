@@ -17,6 +17,8 @@ scikit-optimize
 pandas-market-calendars
 matplotlib
 mplfinance
+stable-baselines3 
+gymnasium
 
 # NOTE: TA-Lib is a dependency that requires special installation.
 # On Windows, you may need to download the wheel file manually.
@@ -37,3 +39,6 @@ beautifulsoup4
 feedparser
 curl_cffi
 markdown-pdf
+crewai
+langchain_community
+litellm

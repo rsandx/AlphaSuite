@@ -16,12 +16,14 @@ import random
 import re
 from typing import Union
 import json
-from functools import wraps
+from functools import wraps, lru_cache
 import yfinance as yf
 from yfinance.exceptions import YFRateLimitError
 import pandas as pd
 import os, time
 from datetime import datetime, timedelta
+import pandas_market_calendars as mcal
+import pytz
 import numpy as np # Ensure numpy is imported
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
@@ -31,11 +33,61 @@ from sqlalchemy.orm import Session
 
 from core.db import get_db
 from tools.file_wrapper import convert_to_json_serializable
-from core.model import object_as_dict, Company, Exchange, PriceHistory, Financials, CompanyOfficer, UpgradeDowngrade, InstitutionalHolding, InsiderTransaction, InsiderRoster, AnalystEarningsEstimate, AnalystRevenueEstimate, AnalystGrowthEstimate, AnalystEarningsHistory, AnalystEpsTrend, AnalystEpsRevisions
+from core.model import (
+    object_as_dict, Company, Exchange, PriceHistory, Financials, CompanyOfficer, UpgradeDowngrade, 
+    InstitutionalHolding, InsiderTransaction, InsiderRoster,   
+    AnalystEarningsEstimate, AnalystRevenueEstimate, AnalystGrowthEstimate, AnalystEarningsHistory, AnalystEpsTrend, AnalystEpsRevisions
+)
 
 logger = logging.getLogger(__name__)
 
+def ttl_cache(ttl_seconds: int, maxsize: int = 128):
+    """
+    A decorator to add a time-to-live (TTL) cache to a function.
+
+    The cache stores the function's result and expires after `ttl_seconds`.
+    It uses an LRU (Least Recently Used) policy to evict old items if the
+    cache exceeds `maxsize`.
+
+    Args:
+        ttl_seconds: The time-to-live for the cache in seconds.
+        maxsize: The maximum size of the cache.
+    """
+    def decorator(func):
+        cache = {}
+        # Use a list to track the order of keys for LRU eviction
+        lru_keys = []
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Create a hashable key from the function's arguments
+            key = (args, tuple(sorted(kwargs.items())))
+            now = time.time()
+
+            # Check if the key exists and is still valid
+            if key in cache and (now - cache[key]['time']) < ttl_seconds:
+                # Move key to the end to signify it was recently used
+                lru_keys.remove(key)
+                lru_keys.append(key)
+                return cache[key]['value']
+
+            result = func(*args, **kwargs)
+
+            # Evict the least recently used item if the cache is full
+            if len(lru_keys) >= maxsize:
+                oldest_key = lru_keys.pop(0)
+                del cache[oldest_key]
+
+            cache[key] = {'value': result, 'time': now}
+            lru_keys.append(key)
+            return result
+        return wrapper
+    return decorator
+
+# --- Global Constants ---
+VOLATILITY_BENCHMARK_TICKER = '^VIX'
 FULL_HISTORY_START_DATE = "2000-01-01" # A sensible default for the earliest date for most stock data.
+TIMEFRAME_OPTIONS = ["1d", "1h", "30m", "15m"]
 
 def yfinance_retry_handler(retries=5, backoff_factor=5, base_sleep_time=60):
     """
@@ -131,53 +183,71 @@ def get_yf_competitors(ticker: str) -> Union[list, dict]:
         except Exception as e:
             return {"error": f"An unexpected error occurred: {e}"}
 
-def find_tickers_with_splits_in_db(db: Session, company_ids: list, start_date: datetime) -> list:
+def load_price_data(ticker: str, start_date: str = None, end_date: str = None, timeframe: str = '1d') -> pd.DataFrame:
     """
-    Queries the database to find companies from a given list that have had a stock split
-    since a specified start date.
+    Loads historical price data for the ticker from the database.
     """
-    if not company_ids:
-        return []
-    
-    return db.query(Company).join(
-        PriceHistory, Company.id == PriceHistory.company_id
-    ).filter(
-        Company.id.in_(company_ids),
-        PriceHistory.date >= start_date,
-        PriceHistory.split_coefficient != 0,
-        PriceHistory.split_coefficient != 1.0
-    ).distinct().all()
+    if not start_date:
+        start_date = FULL_HISTORY_START_DATE
+    if not end_date:
+        end_date = datetime.now().strftime('%Y-%m-%d')
 
-def refresh_split_tickers(db: Session, ticker_map: dict, batch_size: int):
-    """
-    Downloads and saves the full price history for a given list of tickers.
+    db_session = next(get_db())
+    try:
+        company = db_session.query(Company).filter(Company.symbol == ticker).first()
 
-    Args:
-        db: The database session.
-        ticker_map: A dictionary mapping ticker symbols to their company IDs.
-        batch_size: The number of tickers to process in each batch.
-    """
-    tickers_to_process = list(ticker_map.keys())
-    total_tickers = len(tickers_to_process)
+        query = db_session.query(PriceHistory).filter(PriceHistory.company_id == company.id, PriceHistory.timeframe == timeframe)
+        if start_date:
+            query = query.filter(PriceHistory.timestamp >= start_date)
+        if end_date:
+            query = query.filter(PriceHistory.timestamp <= end_date)
+        query = query.order_by(PriceHistory.timestamp.asc()) # Ensure data is sorted chronologically
 
-    for i in range(0, total_tickers, batch_size):
-        batch_tickers = tickers_to_process[i:i + batch_size]
-        logger.info(f"Refreshing full history for batch {i // batch_size + 1}/{total_tickers // batch_size + 1} (tickers {i} to {min(i + batch_size, total_tickers)})")
+        price_data = pd.read_sql(query.statement, db_session.bind) 
         
-        # Download full history for the batch
-        full_history_data = download_multiple_tickers_data(batch_tickers, start_date=FULL_HISTORY_START_DATE, end_date=None, interval="1d")
+        if price_data.empty:
+            # logger.warning(f"No {timeframe} price data found for {ticker} between {start_date} and {end_date}.")
+            # return pd.DataFrame()
+            data_dict = load_ticker_data(ticker, start_date, end_date, timeframe) 
+            data_df = data_dict.get('shareprices', pd.DataFrame()) if data_dict else pd.DataFrame()
+            data_df.columns = [col.lower().replace(' ', '') for col in data_df.columns]
+            if 'date' in data_df.columns:
+                data_df['date'] = pd.to_datetime(data_df['date'])
+                data_df.set_index('date', inplace=True)
+            if data_df.index.tz is not None:
+                data_df.index = data_df.index.tz_localize(None)
+            if 'timestamp' in data_df.columns:
+                data_df.rename(columns={'timestamp': 'date'}, inplace=True)
+            return data_df
+
+        # Ensure essential columns are present
+        for col in ['open', 'high', 'low', 'close', 'adjclose', 'volume']:
+            if col not in price_data.columns:
+                logger.error(f"Essential column '{col}' missing from price data for {ticker}.")
+                return pd.DataFrame()
         
-        # Save the downloaded data
-        if full_history_data is not None and not full_history_data.empty:
-            batch_data_to_save = {}
-            for t in batch_tickers:
-                # Select columns for the current ticker
-                ticker_cols = [c for c in full_history_data.columns if c.startswith(f"{t}-")]
-                if ticker_cols:
-                    ticker_df = full_history_data[ticker_cols].copy()
-                    ticker_df.columns = [col.replace(f"{t}-", "") for col in ticker_cols]
-                    batch_data_to_save[ticker_map[t]] = ticker_df
-            save_or_update_batch_price_data(db, batch_data_to_save)
+        # Rename 'timestamp' to 'date' for backward compatibility within this module
+        price_data.rename(columns={'timestamp': 'date'}, inplace=True)
+        price_data['date'] = pd.to_datetime(price_data['date'])
+        try:
+            # --- Ensure timezone is removed after loading from DB ---
+            if price_data['date'].dt.tz is not None:
+                price_data['date'] = price_data['date'].dt.tz_localize(None)
+            price_data.set_index('date', inplace=True)
+            price_data.drop(columns=['timeframe'], inplace=True, errors='ignore')
+        except Exception as e:
+            logger.error(f"Error setting 'date' as index in load_price_data: {e}")
+            logger.error(f"DataFrame info before error: {price_data.info()}")
+            return pd.DataFrame()
+
+        logger.info(f"Loaded {len(price_data)} {timeframe} data points for {ticker}.")
+        return price_data
+    except Exception as e:
+        logger.error(f"Error loading price data for {ticker}: {e}")
+        return pd.DataFrame()
+    finally:
+        if db_session and db_session.is_active:
+            db_session.close()
 
 
 def save_company_to_db(db: Session, company_info: dict):
@@ -558,14 +628,15 @@ def save_insider_roster_to_db(db: Session, company_id: int, roster_df: pd.DataFr
     except Exception as e:
         db.rollback()
         logger.error(f"Error saving insider roster for company_id {company_id}: {e}")
-
-def save_or_update_batch_price_data(db: Session, batch_price_data: dict):
+        
+def save_or_update_batch_price_data(db: Session, batch_price_data: dict, timeframe: str = '1d'):
     """
     Saves or updates price history for a batch of companies in the database, using PostgreSQL's ON CONFLICT for efficiency.
 
     Args:
         db: The SQLAlchemy database session.
         batch_price_data: A dictionary containing price history data for multiple companies.
+        timeframe: The timeframe of the price data (e.g., '1d', '1h').
     """
     try:
         records_to_insert = []
@@ -575,7 +646,8 @@ def save_or_update_batch_price_data(db: Session, batch_price_data: dict):
                 try:
                     price_data = {
                         "company_id": company_id,
-                        "date": index.to_pydatetime().date(),
+                        "timestamp": index.to_pydatetime(), # Keep as datetime object
+                        "timeframe": timeframe,
                         "open": float(row["Open"]),
                         "high": float(row["High"]),
                         "low": float(row["Low"]),
@@ -596,7 +668,7 @@ def save_or_update_batch_price_data(db: Session, batch_price_data: dict):
             # Use upsert for all entries
             stmt = pg_insert(PriceHistory).values(records_to_insert)
             on_conflict_stmt = stmt.on_conflict_do_update(
-                index_elements=[PriceHistory.company_id, PriceHistory.date],
+                index_elements=[PriceHistory.company_id, PriceHistory.timeframe, PriceHistory.timestamp],
                 set_={
                     "open": stmt.excluded.open,
                     "high": stmt.excluded.high,
@@ -609,7 +681,7 @@ def save_or_update_batch_price_data(db: Session, batch_price_data: dict):
                 }
             )
             db.execute(on_conflict_stmt)
-            logger.info(f"Upserted price history for {len(batch_price_data)} companies with {len(records_to_insert)} entries.")
+            logger.info(f"Upserted {timeframe} price history for {len(batch_price_data)} companies with {len(records_to_insert)} entries.")
 
         db.commit()  # Commit all changes in a single transaction
     except Exception as e:
@@ -748,6 +820,17 @@ def save_extra_company_data_to_db(db, company_id, data, info=None):
         save_analyst_trend_or_revisions_to_db(db, company_id, data.eps_revisions, AnalystEpsRevisions, eps_revisions_mapping, "analyst_eps_revisions")
     except Exception as e:
         logger.warning(f"save_analyst_trend_or_revisions_to_db error for company {company_id}: {e}")
+
+    try:
+        # Get financial statements first, as they are needed to map earnings dates
+        financial_statements = {
+            "quarterly_income_statement": data.get_income_stmt(freq="quarterly"),
+        }
+        quarterly_financials = financial_statements.get("quarterly_income_statement")
+        if quarterly_financials is None:
+            quarterly_financials = pd.DataFrame() # Ensure it's a DataFrame
+    except Exception as e:
+        logger.warning(f"save_earnings_dates_to_db error for company {company_id}: {e}")
     
 
     # Get financial statements
@@ -763,7 +846,7 @@ def save_extra_company_data_to_db(db, company_id, data, info=None):
     return financial_statements
 
 @yfinance_retry_handler()
-def _download_and_save_single_ticker_data(ticker: str, db: Session, start_date: str, end_date: str) -> dict:
+def _download_and_save_single_ticker_data(ticker: str, db: Session, start_date: str, end_date: str, timeframe: str, price_only: bool = False) -> dict:
     """
     Downloads all data for a single ticker and saves to DB. Wrapped with retry logic.
     This is a helper function for load_ticker_data.
@@ -771,22 +854,23 @@ def _download_and_save_single_ticker_data(ticker: str, db: Session, start_date: 
     result = {}
     data = yf.Ticker(ticker)
     company = save_company_to_db(db, data.info)
-    result['company'] = object_as_dict(company)
+    if not price_only:
+        result['company'] = object_as_dict(company)
 
-    financial_statements = save_extra_company_data_to_db(db, company.id, data)
-    result.update(financial_statements)
+        financial_statements = save_extra_company_data_to_db(db, company.id, data)
+        result.update(financial_statements)
     
-    price_data = data.history(start=start_date, end=end_date, auto_adjust=False, period="max")
+    price_data = data.history(start=start_date, end=end_date, auto_adjust=False, period="max", interval=timeframe)
     if price_data is not None:
         if isinstance(price_data.columns, pd.MultiIndex):
-            price_data.columns = [col[0] for col in price_data.columns]
+            price_data.columns = [col[1] if col[0].lower().startswith('adj') else col[0] for col in price_data.columns]
         save_or_update_batch_price_data(db, {company.id: price_data})
         price_data = price_data.reset_index()
         result['shareprices'] = price_data
 
     return result
 
-def load_ticker_data(ticker: str, start_date: str = None, end_date: str = None, refresh: bool = False) -> dict:
+def load_ticker_data(ticker: str, start_date: str = None, end_date: str = None, refresh: bool = False, timeframe: str = '1d', price_only: bool = True) -> dict:
     """
     Loads data for a given ticker, either from the database or by downloading and saving it.
 
@@ -795,6 +879,8 @@ def load_ticker_data(ticker: str, start_date: str = None, end_date: str = None, 
         start_date: Start date for historical data (if applicable).
         end_date: End date for historical data (if applicable).
         refresh: Whether or not download and update the existing data.
+        timeframe: The timeframe of the price data (e.g., '1d', '1h').
+        price_only: Whether or not return only price data.
 
     Returns:
         A dictionary containing the data for the ticker, or None if there is an error.
@@ -816,15 +902,15 @@ def load_ticker_data(ticker: str, start_date: str = None, end_date: str = None, 
             result['company'] = object_as_dict(company)
 
             # Get price history filtered by company_id, start_date and end_date if present
-            query = db.query(PriceHistory).filter(PriceHistory.company_id == company.id)
+            query = db.query(PriceHistory).filter(PriceHistory.company_id == company.id, PriceHistory.timeframe == timeframe)
             if start_date:
-                query = query.filter(PriceHistory.date >= start_date)
+                query = query.filter(PriceHistory.timestamp >= start_date)
             if end_date:
-                query = query.filter(PriceHistory.date <= end_date)
+                query = query.filter(PriceHistory.timestamp <= end_date)
             price_history = query.all()
 
             df = pd.DataFrame([{
-                "Date": record.date,
+                "Date": record.timestamp, # Keep the full timestamp to preserve intraday data
                 "Open": record.open,
                 "High": record.high,
                 "Low": record.low,
@@ -836,32 +922,34 @@ def load_ticker_data(ticker: str, start_date: str = None, end_date: str = None, 
             } for record in price_history])
             if not df.empty:
                 df = df.set_index("Date")
+                df.sort_index(inplace=True) # CRITICAL FIX: Ensure data is sorted chronologically.
                 result['shareprices'] = df
 
-            financials = db.query(Financials).filter(Financials.company_id == company.id).all()
-            statements = {}
-            for record in financials:
-                if record.type not in statements:
-                    statements[record.type] = {}
-                if record.report_date not in statements[record.type]:
-                    statements[record.type][record.report_date] = {}
-                statements[record.type][record.report_date][record.index] = record.value
+            if not price_only:
+                financials = db.query(Financials).filter(Financials.company_id == company.id).all()
+                statements = {}
+                for record in financials:
+                    if record.type not in statements:
+                        statements[record.type] = {}
+                    if record.report_date not in statements[record.type]:
+                        statements[record.type][record.report_date] = {}
+                    statements[record.type][record.report_date][record.index] = record.value
 
-            # Convert to pandas DataFrames
-            for statement_type, report_data in statements.items():
-                statement_list = []
-                for report_date, index_value in report_data.items():
-                    statement_list.append(dict({'Date': report_date}, **index_value))
-                
-                df_statement = pd.DataFrame(statement_list)
-                if not df_statement.empty:
-                    result[statement_type] = df_statement.set_index('Date')
+                # Convert to pandas DataFrames
+                for statement_type, report_data in statements.items():
+                    statement_list = []
+                    for report_date, index_value in report_data.items():
+                        statement_list.append(dict({'Date': report_date}, **index_value))
+                    
+                    df_statement = pd.DataFrame(statement_list)
+                    if not df_statement.empty:
+                        result[statement_type] = df_statement.set_index('Date')
 
             return result
 
         # Data not in db or needs refresh. Download and save
         logger.info(f"Downloading and saving data for {ticker}")
-        download_result = _download_and_save_single_ticker_data(ticker, db, start_date, end_date)
+        download_result = _download_and_save_single_ticker_data(ticker, db, start_date, end_date, timeframe, price_only)
         if isinstance(download_result, dict) and "error" in download_result:
             logger.error(f"Failed to download and save data for {ticker}: {download_result['error']}")
             return None
@@ -887,6 +975,8 @@ def download_multiple_tickers_data(tickers: list, start_date: str = None, end_da
     Downloads price history data for multiple tickers, handling rate limits and retries.
     """
     all_data = {}
+
+    # For multiple tickers, we build a dictionary and concatenate.
     for ticker in tickers:
         ticker_data = _fetch_ticker_history(ticker, start_date, end_date, interval)
         if isinstance(ticker_data, dict) and 'error' in ticker_data:
@@ -895,6 +985,7 @@ def download_multiple_tickers_data(tickers: list, start_date: str = None, end_da
         elif not ticker_data.empty:
             all_data[ticker] = ticker_data
 
+    # Concatenate multiple tickers into a single DataFrame with a MultiIndex
     if all_data:
         result = pd.concat(all_data, axis=1, names=["Ticker", "Attributes"])
         result.columns = [f'{col[1]}' if col[0] == "Adj Close" else f'{col[0]}-{col[1]}' for col in result.columns] 
@@ -925,133 +1016,241 @@ def get_company_info_batch(tickers: list) -> dict:
     return company_info_batch
 
 @yfinance_retry_handler()
-def get_analyst_upgrades_downgrades(ticker: str) -> Union[list, dict]:
-    """Retrieves analyst upgrades/downgrades for a ticker with retry logic."""
-    logger.info(f"Downloading analyst upgrades/downgrades for {ticker}")
-    company_data = yf.Ticker(ticker)
-    if company_data:
-        data = company_data.upgrades_downgrades
-        if data is not None and not data.empty:
-            data.index = data.index.strftime('%Y-%m-%d %H:%M:%S')
-            return data.reset_index().to_dict(orient='records')
-        else:
-            return []
-    return {"error": f"Could not retrieve ticker data for {ticker}"}
+def get_analyst_upgrades_downgrades(ticker: str, refresh: bool = False) -> Union[pd.DataFrame, dict]:
+    """Retrieves analyst upgrades/downgrades for a ticker, prioritizing the database."""
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company {ticker} not found in DB."}
+
+        if not refresh:
+            records = db.query(UpgradeDowngrade).filter(UpgradeDowngrade.company_id == company.id).order_by(UpgradeDowngrade.date.desc()).all()
+            if records:
+                logger.debug(f"Loaded {len(records)} upgrades/downgrades from DB for {ticker}.")
+                df = pd.DataFrame([object_as_dict(r) for r in records])
+                df = df.drop(columns=['id', 'company_id'])
+                df['date'] = pd.to_datetime(df['date'])
+                return df.set_index('date')
+
+        logger.info(f"Fetching analyst upgrades/downgrades from yfinance for {ticker}")
+        company_data = yf.Ticker(ticker)
+        if company_data:
+            data = company_data.upgrades_downgrades
+            if data is not None and not data.empty:
+                save_upgrades_downgrades_to_db(db, company.id, data)
+                return data
+            return pd.DataFrame()
+        return {"error": f"Could not retrieve ticker data for {ticker}"}
+    finally:
+        db.close()
 
 @yfinance_retry_handler()
-def _get_holdings_data(ticker: str, holder_type: str) -> Union[list, dict]:
-    """Helper to retrieve institutional or mutual fund holdings."""
-    logger.info(f"Downloading {holder_type} holdings for {ticker}")
-    company_data = yf.Ticker(ticker)
-    if not company_data:
-        return {"error": f"Could not retrieve ticker data for {ticker}"}
+def _get_holdings_data(ticker: str, holder_type: str, refresh: bool = False) -> Union[pd.DataFrame, dict]:
+    """Helper to retrieve institutional or mutual fund holdings, prioritizing the database."""
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company {ticker} not found in DB."}
 
-    if holder_type == 'institutional':
-        data = company_data.institutional_holders
-    elif holder_type == 'mutualfund':
-        data = company_data.mutualfund_holders
-    else:
-        return {"error": "Invalid holder type specified."}
-    
-    if data is not None and not data.empty:
-        if 'Date Reported' in data.columns:
-            data['Date Reported'] = data['Date Reported'].astype(str)
-        return data.to_dict(orient='records')
-    else:
-        return []
+        if not refresh:
+            records = db.query(InstitutionalHolding).filter(
+                InstitutionalHolding.company_id == company.id,
+                InstitutionalHolding.holder_type == holder_type
+            ).order_by(InstitutionalHolding.date_reported.desc()).all()
+            if records:
+                logger.debug(f"Loaded {len(records)} {holder_type} holdings from DB for {ticker}.")
+                df = pd.DataFrame([object_as_dict(r) for r in records])
+                return df.drop(columns=['id', 'company_id', 'holder_type'])
 
-def get_institutional_holdings(ticker):
+        logger.info(f"Downloading {holder_type} holdings for {ticker}")
+        company_data = yf.Ticker(ticker)
+        if not company_data:
+            return {"error": f"Could not retrieve ticker data for {ticker}"}
+
+        if holder_type == 'institutional':
+            data = company_data.institutional_holders
+        elif holder_type == 'mutualfund':
+            data = company_data.mutualfund_holders
+        else:
+            return {"error": "Invalid holder type specified."}
+        
+        if data is not None and not data.empty:
+            save_institutional_holdings_to_db(db, company.id, data, holder_type)
+            return data
+        else:
+            return pd.DataFrame()
+    finally:
+        db.close()
+
+def get_institutional_holdings(ticker, refresh: bool = False):
     """Retrieves institutional holdings for a ticker."""
-    return _get_holdings_data(ticker, 'institutional')
+    return _get_holdings_data(ticker, 'institutional', refresh)
 
-def get_mutualfund_holdings(ticker):
+def get_mutualfund_holdings(ticker, refresh: bool = False):
     """Retrieves mutual fund holdings for a ticker."""
-    return _get_holdings_data(ticker, 'mutualfund')
+    return _get_holdings_data(ticker, 'mutualfund', refresh)
 
 @yfinance_retry_handler()
-def get_insider_transactions(ticker: str) -> Union[list, dict]:
-    """Retrieves insider transactions for a ticker."""
-    logger.info(f"Downloading insider transactions for {ticker}")
-    company_data = yf.Ticker(ticker)
-    if company_data:
-        data = company_data.insider_transactions
-        if data is not None and not data.empty:
-            if 'Start Date' in data.columns:
-                data['Start Date'] = data['Start Date'].astype(str)
-            return data.to_dict(orient='records')
-        else:
-            return []
-    return {"error": f"Could not retrieve ticker data for {ticker}"}
+def get_insider_transactions(ticker: str, refresh: bool = False) -> Union[pd.DataFrame, dict]:
+    """Retrieves insider transactions for a ticker, prioritizing the database."""
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company {ticker} not found in DB."}
 
-@yfinance_retry_handler()
-def get_insider_roster(ticker: str) -> Union[list, dict]:
-    """Retrieves insider roster for a ticker."""
-    logger.info(f"Downloading insider roster for {ticker}")
-    company_data = yf.Ticker(ticker)
-    if company_data:
-        data = company_data.insider_roster_holders
-        if data is not None and not data.empty:
-            if 'Most Recent Transaction Date' in data.columns:
-                data['Most Recent Transaction Date'] = data['Most Recent Transaction Date'].astype(str)
-            return data.to_dict(orient='records')
-        else:
-            return []
-    return {"error": f"Could not retrieve ticker data for {ticker}"}
+        if not refresh:
+            records = db.query(InsiderTransaction).filter(InsiderTransaction.company_id == company.id).order_by(InsiderTransaction.start_date.desc()).all()
+            if records:
+                logger.debug(f"Loaded {len(records)} insider transactions from DB for {ticker}.")
+                df = pd.DataFrame([object_as_dict(r) for r in records])
+                return df.drop(columns=['id', 'company_id'])
 
-@yfinance_retry_handler()
-def _get_analyst_df_data(ticker: str, df_name: str) -> Union[list, dict]:
-    """Helper to retrieve various analyst estimate DataFrames."""
-    logger.info(f"Downloading {df_name} for {ticker}")
-    company_data = yf.Ticker(ticker)
-    if not company_data:
+        logger.info(f"Downloading insider transactions for {ticker}")
+        company_data = yf.Ticker(ticker)
+        if company_data:
+            data = company_data.insider_transactions
+            if data is not None and not data.empty:
+                save_insider_transactions_to_db(db, company.id, data)
+                return data
+            else:
+                return pd.DataFrame()
         return {"error": f"Could not retrieve ticker data for {ticker}"}
-
-    data_attr = getattr(company_data, df_name, None)
-    if data_attr is None or data_attr.empty:
-        return []
-
-    if isinstance(data_attr.index, pd.DatetimeIndex):
-        data_attr.index = data_attr.index.strftime('%Y-%m-%d %H:%M:%S')
-    
-    df_to_convert = data_attr.to_frame(name=data_attr.name or 'Value') if isinstance(data_attr, pd.Series) else data_attr
-    return df_to_convert.reset_index().to_dict(orient='records')
-
-def get_analyst_earnings_estimates(ticker, retries=5, backoff_factor=5, base_sleep_time=60):
-    """Retrieves analyst earnings estimates for a ticker."""
-    return _get_analyst_df_data(ticker, 'earnings_estimate', retries, backoff_factor, base_sleep_time)
-
-def get_analyst_revenue_estimates(ticker, retries=5, backoff_factor=5, base_sleep_time=60):
-    """Retrieves analyst revenue estimates for a ticker."""
-    return _get_analyst_df_data(ticker, 'revenue_estimate', retries, backoff_factor, base_sleep_time)
-
-def get_analyst_growth_estimates(ticker, retries=5, backoff_factor=5, base_sleep_time=60):
-    """Retrieves analyst growth estimates for a ticker."""
-    return _get_analyst_df_data(ticker, 'growth_estimates', retries, backoff_factor, base_sleep_time)
-
-def get_analyst_earnings_history(ticker, retries=5, backoff_factor=5, base_sleep_time=60):
-    """Retrieves analyst earnings history for a ticker."""
-    return _get_analyst_df_data(ticker, 'earnings_history', retries, backoff_factor, base_sleep_time)
-
-def get_analyst_eps_trend(ticker, retries=5, backoff_factor=5, base_sleep_time=60):
-    """Retrieves analyst EPS trend for a ticker."""
-    return _get_analyst_df_data(ticker, 'eps_trend', retries, backoff_factor, base_sleep_time)
-
-def get_analyst_eps_revisions(ticker, retries=5, backoff_factor=5, base_sleep_time=60):
-    """Retrieves analyst EPS revisions for a ticker."""
-    return _get_analyst_df_data(ticker, 'eps_revisions', retries, backoff_factor, base_sleep_time)
+    finally:
+        db.close()
 
 @yfinance_retry_handler()
-def get_analyst_recommendations_summary(ticker: str) -> Union[list, dict]:
-    """Retrieves analyst recommendations summary (buy/sell/hold counts) for a ticker."""
-    logger.info(f"Downloading analyst recommendations summary for {ticker}")
-    company_data = yf.Ticker(ticker)
-    if company_data:
-        data = company_data.recommendations_summary
-        if data is not None and not data.empty:
-            return data.reset_index().to_dict(orient='records')
-        else:
-            return []
-    return {"error": "Could not retrieve ticker data."}
+def get_insider_roster(ticker: str, refresh: bool = False) -> Union[pd.DataFrame, dict]:
+    """Retrieves insider roster for a ticker, prioritizing the database."""
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company {ticker} not found in DB."}
+
+        if not refresh:
+            records = db.query(InsiderRoster).filter(InsiderRoster.company_id == company.id).all()
+            if records:
+                logger.debug(f"Loaded {len(records)} insider roster entries from DB for {ticker}.")
+                df = pd.DataFrame([object_as_dict(r) for r in records])
+                return df.drop(columns=['id', 'company_id'])
+
+        logger.info(f"Downloading insider roster for {ticker}")
+        company_data = yf.Ticker(ticker)
+        if company_data:
+            data = company_data.insider_roster_holders
+            if data is not None and not data.empty:
+                save_insider_roster_to_db(db, company.id, data)
+                return data
+            else:
+                return pd.DataFrame()
+        return {"error": f"Could not retrieve ticker data for {ticker}"}
+    finally:
+        db.close()
+
+@yfinance_retry_handler()
+def _get_analyst_df_data(ticker: str, df_name: str, model_class, save_fn, refresh: bool = False) -> Union[pd.DataFrame, dict]:
+    """
+    Generic helper to retrieve various analyst estimate DataFrames, prioritizing the database.
+    """
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company {ticker} not found in DB."}
+
+        if not refresh:
+            records = db.query(model_class).filter(model_class.company_id == company.id).all()
+            if records:
+                logger.debug(f"Loaded {len(records)} {df_name} records from DB for {ticker}.")
+                df = pd.DataFrame([object_as_dict(r) for r in records])
+                # Set index based on what yfinance would do, for consistency
+                if 'period_label' in df.columns:
+                    df = df.set_index('period_label')
+                elif 'report_date' in df.columns:
+                    df['report_date'] = pd.to_datetime(df['report_date'])
+                    df = df.set_index('report_date')
+                return df.drop(columns=['id', 'company_id', 'last_updated'], errors='ignore')
+
+        logger.info(f"Downloading {df_name} for {ticker}")
+        company_data = yf.Ticker(ticker)
+        if not company_data:
+            return {"error": f"Could not retrieve ticker data for {ticker}"}
+
+        data_attr = getattr(company_data, df_name, None)
+        if data_attr is None or data_attr.empty:
+            return pd.DataFrame()
+
+        # Call the specific save function
+        save_fn(db, company.id, data_attr)
+        
+        return data_attr
+    finally:
+        db.close()
+
+def get_analyst_earnings_estimates(ticker, refresh: bool = False):
+    """Retrieves analyst earnings estimates for a ticker."""
+    return _get_analyst_df_data(ticker, 'earnings_estimate', AnalystEarningsEstimate, save_analyst_earnings_estimates_to_db, refresh)
+
+def get_analyst_revenue_estimates(ticker, refresh: bool = False):
+    """Retrieves analyst revenue estimates for a ticker."""
+    return _get_analyst_df_data(ticker, 'revenue_estimate', AnalystRevenueEstimate, save_analyst_revenue_estimates_to_db, refresh)
+
+def get_analyst_growth_estimates(ticker, refresh: bool = False):
+    """Retrieves analyst growth estimates for a ticker."""
+    return _get_analyst_df_data(ticker, 'growth_estimates', AnalystGrowthEstimate, save_analyst_growth_estimates_to_db, refresh)
+
+def get_analyst_earnings_history(ticker, refresh: bool = False):
+    """Retrieves analyst earnings history for a ticker."""
+    return _get_analyst_df_data(ticker, 'earnings_history', AnalystEarningsHistory, save_analyst_earnings_history_to_db, refresh)
+
+def get_analyst_eps_trend(ticker, refresh: bool = False):
+    """Retrieves analyst EPS trend for a ticker."""
+    eps_trend_mapping = {"current_estimate": "current", "seven_days_ago": "7daysAgo", 
+                         "thirty_days_ago": "30daysAgo", "sixty_days_ago": "60daysAgo", 
+                         "ninety_days_ago": "90daysAgo"}
+    save_fn = lambda db, cid, df: save_analyst_trend_or_revisions_to_db(db, cid, df, AnalystEpsTrend, eps_trend_mapping, "analyst_eps_trend")
+    return _get_analyst_df_data(ticker, 'eps_trend', AnalystEpsTrend, save_fn, refresh)
+
+def get_analyst_eps_revisions(ticker, refresh: bool = False):
+    """Retrieves analyst EPS revisions for a ticker."""
+    eps_revisions_mapping = {"up_last_7_days": "upLast7days", "up_last_30_days": "upLast30days", 
+                             "down_last_7_days": "downLast7Days", "down_last_30_days": "downLast30days"}
+    save_fn = lambda db, cid, df: save_analyst_trend_or_revisions_to_db(db, cid, df, AnalystEpsRevisions, eps_revisions_mapping, "analyst_eps_revisions")
+    return _get_analyst_df_data(ticker, 'eps_revisions', AnalystEpsRevisions, save_fn, refresh)
+
+@yfinance_retry_handler()
+def get_analyst_recommendations_summary(ticker: str, refresh: bool = False) -> Union[pd.DataFrame, dict]:
+    """Retrieves analyst recommendations summary, prioritizing the database."""
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company {ticker} not found in DB."}
+
+        # The most important recommendation data is in the Company table.
+        # We can construct a summary DataFrame from this.
+        if not refresh and company.recommendationkey:
+            logger.debug(f"Loaded recommendations summary from DB for {ticker}.")
+            summary_data = {
+                'period': ['0m'],
+                'strongBuy': [None], 'buy': [None], 'hold': [None], 'sell': [None], 'strongSell': [None],
+                'rating': [company.recommendationkey]
+            }
+            return pd.DataFrame(summary_data)
+
+        logger.info(f"Fetching analyst recommendations summary from yfinance for {ticker}")
+        company_data = yf.Ticker(ticker)
+        if company_data:
+            data = company_data.recommendations_summary
+            # The save_company_to_db function already saves the relevant fields.
+            # This function now primarily serves to get the full breakdown if needed.
+            return data if data is not None else pd.DataFrame()
+        return {"error": "Could not retrieve ticker data."}
+    finally:
+        db.close()
 
 @yfinance_retry_handler()
 def get_earnings_dates(ticker: str) -> Union[pd.DataFrame, dict]:
@@ -1102,7 +1301,7 @@ def _process_company_info_batches(db: Session, tickers: list, batch_size: int, q
                 processed_tickers.append(ticker)
     return processed_tickers
 
-def _process_price_history_batches(db: Session, tickers: list, batch_size: int, start_date: str, end_date: str):
+def _process_price_history_batches(db: Session, tickers: list, batch_size: int, start_date: str, end_date: str, interval: str):
     """Downloads and saves price history for a list of tickers."""
     total_tickers = len(tickers)
     inactive_tickers = []
@@ -1110,7 +1309,8 @@ def _process_price_history_batches(db: Session, tickers: list, batch_size: int, 
         batch = tickers[i:i + batch_size]
         logger.info(f"Processing share price batch {i // batch_size + 1}/{total_tickers // batch_size + 1} (tickers {i} to {min(i + batch_size, total_tickers)})")
         
-        share_price_data = download_multiple_tickers_data(batch, start_date, end_date)
+        share_price_data = download_multiple_tickers_data(batch, start_date, end_date, interval)
+        
         # --- Track found tickers to correctly identify inactive ones ---
         found_tickers_in_batch = set()
 
@@ -1165,7 +1365,7 @@ def _process_price_history_batches(db: Session, tickers: list, batch_size: int, 
                         batch_price_data[company.id] = price_data
             
             if batch_price_data:
-                save_or_update_batch_price_data(db, batch_price_data)
+                save_or_update_batch_price_data(db, batch_price_data, timeframe=interval)
                 
                 # --- After saving, check if any of the updated tickers in THIS BATCH had a split ---
                 if start_date != FULL_HISTORY_START_DATE:
@@ -1195,8 +1395,8 @@ def _process_price_history_batches(db: Session, tickers: list, batch_size: int, 
     if inactive_tickers:
         logger.info(f"Total inactive tickers identified in this run: {len(inactive_tickers)}")
 
-def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY", "ETF", "CRYPTOCURRENCY"], ticker_file="yhallsym.json", interval="1d",
-        batch_size=50, start_date=FULL_HISTORY_START_DATE, end_date=None, existing_tickers_action='skip', update_prices_action='yes'):
+def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY", "ETF", "CRYPTOCURRENCY"], ticker_file="yhallsym.json", ticker_list: list = None, interval="1d",
+        batch_size=50, start_date=FULL_HISTORY_START_DATE, end_date=None, existing_tickers_action='skip', update_prices_action='yes', **kwargs):
     """
     Loads tickers, downloads company data in batches, and saves or updates data in the database for specified quote types.
 
@@ -1205,6 +1405,8 @@ def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY
         exchange: The exchange to filter tickers by (e.g., "NAS", "NYQ").
         quote_types: A list of quote types to include (e.g., ["EQUITY", "ETF"]).
         ticker_file: The file containing the list of tickers.
+        ticker_list: A direct list of tickers to process, which overrides market/file discovery.
+        interval: The price data interval to download (e.g., "1d", "1h").
         batch_size: The number of tickers to process in each batch.
         start_date: Start date for historical data download (if required). If None, default values are used.
         end_date: End date for historical data download (if required). If None, default values are used.
@@ -1213,8 +1415,8 @@ def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY
         - 'only': Only process tickers that already exist in the database.
         - 'all': Process all tickers, regardless of whether they exist in the database.
         update_prices_action: 
-        - 'yes': Update company info and price history using the given start and end date.
-        - 'no': Update company info and don't update price history.
+        - 'yes': Update price history using the given start and end date.
+        - 'no': Don't update price history.
         - 'only': Only update price history using the given start and end date.
         - 'last_day': Only update price history from the last day.
 
@@ -1224,7 +1426,12 @@ def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY
     db = next(get_db())
     try:
         # Step 1: Determine which tickers to process
-        tickers_to_process = _get_tickers_for_update(db, market, exchange, ticker_file, existing_tickers_action)
+        if ticker_list:
+            logger.info(f"Processing a direct list of {len(ticker_list)} tickers.")
+            tickers_to_process = ticker_list
+        else:
+            tickers_to_process = _get_tickers_for_update(db, market, exchange, ticker_file, existing_tickers_action)
+
         if not tickers_to_process:
             logger.info("No tickers to process based on the specified criteria.")
             return
@@ -1234,26 +1441,210 @@ def save_or_update_company_data(market="us", exchange=None, quote_types=["EQUITY
             tickers_to_process = _process_company_info_batches(db, tickers_to_process, batch_size, quote_types)
             logger.info(f"Found {len(tickers_to_process)} tickers matching quote types {quote_types if quote_types else 'any'} to process.")
 
-        if update_prices_action == "no":
-            logger.info("Skipping price updates as per configuration.")
-            return
+        # Step 3: Process price history, but only if requested.
+        if update_prices_action != "no":
+            if update_prices_action == 'last_day':
+                # Download the last day's data
+                start_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            
+            # If end_date is today or in the future, set it to None to ensure today's data is included.
+            # yfinance's end_date is exclusive.
+            if end_date and datetime.strptime(end_date, '%Y-%m-%d').date() >= datetime.now().date():
+                logger.info("end_date is today or later. Setting to None to include today's price data.")
+                end_date = None
 
-        # Step 3: Process price history
-        if update_prices_action == 'last_day':
-            start_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        
-        # If end_date is today or in the future, set it to None to ensure today's data is included.
-        # yfinance's end_date is exclusive.
-        if end_date and datetime.strptime(end_date, '%Y-%m-%d').date() == datetime.now().date():
-            logger.info("end_date is today. Setting to None to include today's price data.")
-            end_date = None
-
-        _process_price_history_batches(db, tickers_to_process, batch_size, start_date, end_date)
+            _process_price_history_batches(db, tickers_to_process, batch_size, start_date, end_date, interval)
 
     except Exception as e:
         logger.error(f"An error occurred during the data update process: {e}", exc_info=True)
     finally:
         db.close()
+
+def find_tickers_with_splits_in_db(db: Session, company_ids: list, start_date: datetime) -> list:
+    """
+    Queries the database to find companies from a given list that have had a stock split
+    since a specified start date.
+    """
+    if not company_ids:
+        return []
+    
+    return db.query(Company).join(
+        PriceHistory, Company.id == PriceHistory.company_id
+    ).filter(
+        Company.id.in_(company_ids),
+        PriceHistory.timestamp >= start_date,
+        PriceHistory.split_coefficient != 0,
+        PriceHistory.split_coefficient != 1.0
+    ).distinct().all()
+
+def refresh_split_tickers(db: Session, ticker_map: dict, batch_size: int):
+    """
+    Downloads and saves the full price history for a given list of tickers.
+
+    Args:
+        db: The database session.
+        ticker_map: A dictionary mapping ticker symbols to their company IDs.
+        batch_size: The number of tickers to process in each batch.
+    """
+    tickers_to_process = list(ticker_map.keys())
+    total_tickers = len(tickers_to_process)
+
+    for i in range(0, total_tickers, batch_size):
+        batch_tickers = tickers_to_process[i:i + batch_size]
+        logger.info(f"Refreshing full history for batch {i // batch_size + 1}/{total_tickers // batch_size + 1} (tickers {i} to {min(i + batch_size, total_tickers)})")
+        
+        # Download full history for the batch
+        full_history_data = download_multiple_tickers_data(batch_tickers, start_date=FULL_HISTORY_START_DATE, end_date=None, interval="1d")
+        
+        # Save the downloaded data
+        if full_history_data is not None and not full_history_data.empty:
+            batch_data_to_save = {}
+            for t in batch_tickers:
+                # Select columns for the current ticker
+                ticker_cols = [c for c in full_history_data.columns if c.startswith(f"{t}-")]
+                if ticker_cols:
+                    ticker_df = full_history_data[ticker_cols].copy()
+                    ticker_df.columns = [col.replace(f"{t}-", "") for col in ticker_cols]
+                    batch_data_to_save[ticker_map[t]] = ticker_df
+            save_or_update_batch_price_data(db, batch_data_to_save, timeframe='1d')
+
+def load_ticker_price_data(ticker: str, timeframe: str, start_date: str = None, end_date: str = None, refresh: bool = False) -> dict:
+    """
+    Loads price data for a given ticker and timeframe, either from the database or by downloading and saving it. It automatically checks for stale data and downloads if necessary.
+
+    Args:
+        ticker: The stock ticker symbol.
+        timeframe: The desired intraday timeframe (e.g., '1h', '30m', '15m').
+        start_date: Start date for historical data (if applicable).
+        end_date: End date for historical data (if applicable).
+        refresh: If True, forces a re-download regardless of data staleness.
+
+    Returns:
+        A dictionary containing the data for the ticker and timeframe, or None if there is an error.
+    """
+    db = next(get_db())
+    try:
+        company = db.query(Company).filter(Company.symbol == ticker).first()
+        if not company:
+            return {"error": f"Company with ticker {ticker} not found in database."}
+
+        # Helper to fetch from DB
+        def fetch_from_db():
+            query = db.query(PriceHistory).filter(
+                PriceHistory.company_id == company.id,
+                PriceHistory.timeframe == timeframe
+            )
+            if start_date:
+                query = query.filter(PriceHistory.timestamp >= start_date)
+            if end_date:
+                query = query.filter(PriceHistory.timestamp <= end_date)
+            return query.order_by(PriceHistory.timestamp.asc()).all()
+
+        price_history = fetch_from_db()
+
+        # --- Determine if we need to download new data ---
+        should_download = False
+        if refresh:
+            should_download = True
+            logger.info(f"Forcing refresh for {ticker} on {timeframe} timeframe.")
+        elif not price_history:
+            should_download = True
+            logger.info(f"No existing {timeframe} data for {ticker}. Downloading.")
+        else:
+            # Data exists, check if it's stale
+            last_timestamp = price_history[-1].timestamp
+            is_stale = False
+            if timeframe == '1d':
+                # For daily data, check if it's stale based on market close + 2 hours.
+                exchange_info = db.query(Exchange).filter(Exchange.exchange_code == company.exchange).first()
+                calendar_map = {
+                    'NYQ': 'NYSE', 'NMS': 'NASDAQ', 'PCX': 'NYSE', 'NGM': 'NASDAQ', 'NCM': 'NASDAQ', 'BTS': 'NYSE', 'ASE': 'NYSE',
+                    'TOR': 'TSX', 'VAN': 'TSXV', 'LSE': 'LSE', 'LON': 'LSE', 'PAR': 'EUREX', 'FRA': 'EUREX', 'GER': 'EUREX',
+                    'HKG': 'HKEX', 'TYO': 'JPX', 'ASX': 'ASX', 'SSE': 'SSE',
+                }
+                calendar_name = calendar_map.get(company.exchange)
+
+                if calendar_name:
+                    try:
+                        market_cal = mcal.get_calendar(calendar_name)
+                        market_tz = market_cal.tz
+                        now_market_time = datetime.now(market_tz)
+                        today_str = now_market_time.strftime('%Y-%m-%d')
+                        schedule = market_cal.schedule(start_date=today_str, end_date=today_str)
+
+                        if not schedule.empty:
+                            market_close_dt = schedule.iloc[0].market_close
+                            safe_download_time = market_close_dt + timedelta(hours=2)
+                            if now_market_time > safe_download_time and last_timestamp.date() < now_market_time.date():
+                                is_stale = True
+                    except Exception as e:
+                        logger.warning(f"Could not get market calendar for {calendar_name}. Falling back to simple delta. Error: {e}")
+                        if datetime.utcnow() - last_timestamp > timedelta(days=1): is_stale = True
+                else: # Fallback for exchanges not in our map
+                    if datetime.utcnow() - last_timestamp > timedelta(days=1): is_stale = True
+            else: # For intraday timeframes
+                if timeframe.endswith('m'): delta = timedelta(minutes=int(timeframe[:-1]))
+                elif timeframe.endswith('h'): delta = timedelta(hours=int(timeframe[:-1]))
+                if datetime.utcnow() - last_timestamp > delta: is_stale = True
+
+            if is_stale:
+                is_requesting_recent_data = not end_date or datetime.strptime(end_date, '%Y-%m-%d').date() >= datetime.utcnow().date()
+                if is_requesting_recent_data:
+                    should_download = True
+                    logger.info(f"Data for {ticker} {timeframe} is stale (last bar: {last_timestamp}). Triggering update.")
+
+        if should_download:
+            logger.info(f"Downloading {timeframe} data for {ticker}...")
+            yf_ticker = yf.Ticker(ticker)
+            
+            # yfinance has limits on how far back intraday data can be fetched.
+            # 'max' for 1h is 730d. For minute data, it's shorter (e.g., 60d for 1m-30m).
+            # We use a safe period that covers most use cases without being excessive.
+            period_for_yf = '730d' if 'h' in timeframe else '60d'
+            
+            try:
+                new_price_history = yf_ticker.history(period=period_for_yf, interval=timeframe, auto_adjust=False)
+                if not new_price_history.empty:
+                    # Handle MultiIndex columns if present
+                    if isinstance(new_price_history.columns, pd.MultiIndex):
+                        new_price_history.columns = [col[0] for col in new_price_history.columns]
+                    
+                    save_or_update_batch_price_data(db, {company.id: new_price_history}, timeframe=timeframe)
+                    # Re-fetch from DB to get the potentially updated data
+                    price_history = fetch_from_db()
+                else:
+                    logger.warning(f"No new {timeframe} data returned from yfinance for {ticker}. Market may be closed or data unavailable.")
+            except Exception as e:
+                logger.error(f"Failed to download {timeframe} data for {ticker}: {e}")
+
+        if price_history:
+            df = pd.DataFrame([{"Date": record.timestamp, "Open": record.open, "High": record.high, "Low": record.low, "Close": record.close, "Adj Close": record.adjclose, "Volume": record.volume} for record in price_history])
+            df = df.set_index("Date")
+            return {'shareprices': df}
+        else:
+             return {'shareprices': pd.DataFrame()}
+    finally:
+        db.close()
+
+@ttl_cache(ttl_seconds=28800) # Cache for 8 hours (8 * 60 * 60)
+def download_risk_free_rate() -> float:
+    """
+    Fetches the annualized risk-free rate using yfinance (^IRX).
+
+    The result is cached with a time-to-live (TTL) to avoid excessive API calls
+    for a value that changes infrequently.
+    """
+    logger.info("Fetching risk-free rate from yfinance...")
+    try:
+        # ^IRX is the 13-week T-bill, a common proxy for the short-term RFR.
+        # Fetching a short period to get the latest closing yield.
+        ticker_data = yf.download('^IRX', period="5d", progress=False)
+        risk_free_rate_percent = ticker_data['Close'].iloc[-1].iloc[0]
+    except Exception as e:
+        logger.warning(f"Could not fetch risk-free rate from yfinance: {e}. Using default of 2.0.")
+        return 2.0 # Use a reasonable default estimate if fetching fails
+    return float(risk_free_rate_percent)
+  
 
 def get_all_tickers_in_market(market: str = None, exchange: str = None, ticker_file: str = "yhallsym.json") -> Union[list, dict]:
     """
@@ -1324,6 +1715,26 @@ def get_all_tickers_in_market(market: str = None, exchange: str = None, ticker_f
         logger.error(f"An unexpected error occurred in get_all_tickers_in_market: {e}", exc_info=True)
         return {"error": str(e)}
 
+# Mapping from database sector names to their corresponding SPDR Select Sector ETFs.
+# The secondary benchmark is always the S&P 500.
+PRIMARY_BENCHMARK = '^SPX'
+
+SECTOR_TO_ETF_MAP = {
+    "Technology": "XLK",
+    "Financial Services": "XLF",
+    "Healthcare": "XLV",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Consumer Cyclical": "XLY",      # Maps to Consumer Discretionary
+    "Consumer Defensive": "XLP",     # Maps to Consumer Staples
+    "Utilities": "XLU",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+}
+
+BENCHMARK_SYMBOLS = [PRIMARY_BENCHMARK] + list(SECTOR_TO_ETF_MAP.values())
+
 def get_benchmark_ticker_for_asset(ticker: str) -> tuple[str, str]:
     """
     Dynamically determines the most appropriate market benchmark ETF for a given stock ticker
@@ -1336,35 +1747,17 @@ def get_benchmark_ticker_for_asset(ticker: str) -> tuple[str, str]:
     Returns:
         A tuple containing the primary benchmark ticker and the secondary benchmark ticker.
     """
-    # Mapping from database sector names to their corresponding SPDR Select Sector ETFs.
-    # The secondary benchmark is always the S&P 500.
-    PRIMARY_BENCHMARK = '^SPX'
-    SECONDARY_BENCHMARK = '^SPX'
-
-    SECTOR_TO_ETF_MAP = {
-        "Technology": "XLK",
-        "Financial Services": "XLF",
-        "Healthcare": "XLV",
-        "Energy": "XLE",
-        "Industrials": "XLI",
-        "Consumer Cyclical": "XLY",      # Maps to Consumer Discretionary
-        "Consumer Defensive": "XLP",     # Maps to Consumer Staples
-        "Utilities": "XLU",
-        "Basic Materials": "XLB",
-        "Real Estate": "XLRE",
-        "Communication Services": "XLC",
-    }
-
+    primary_benchmark = secondary_benchmark = PRIMARY_BENCHMARK
     db_session = next(get_db())
     try:
         company = db_session.query(Company).filter(Company.symbol == ticker).first()
         if company and company.sector in SECTOR_TO_ETF_MAP:
             # If a sector ETF is found, it becomes the primary benchmark.
-            PRIMARY_BENCHMARK = SECTOR_TO_ETF_MAP[company.sector]
+            primary_benchmark = SECTOR_TO_ETF_MAP[company.sector]
     finally:
         db_session.close()
     
-    return PRIMARY_BENCHMARK, SECONDARY_BENCHMARK
+    return primary_benchmark, secondary_benchmark
 
 
 # Create a dictionary to map ticker suffixes to exchanges (expand as needed)
@@ -1427,7 +1820,7 @@ EXCHANGE_SUFFIX_MAP = {
     ".AS": "AMS",  # Euronext Amsterdam
     ".OL": "OSL",  # Oslo Stock Exchange
     ".LS": "LIS",  # Euronext Lisbon
-    ".MC": "MCE",  # Bolsas y Mercados Españoles
+    ".MC": "MCE",  # Bolsas y Mercados EspaÃ±oles
     ".ST": "STO",  # Nasdaq OMX Stockholm
     ".SW": "SWX",  # SIX Swiss Exchange
     ".Z": "SWX",  # SIX Swiss Exchange
@@ -1504,7 +1897,7 @@ EXCHANGE_MARKET_MAP = {  # Expand as needed
     "AMS": "nl",   # Euronext Amsterdam -> Netherlands
     "OSL": "no",   # Oslo Stock Exchange -> Norway
     "LIS": "pt",   # Euronext Lisbon -> Portugal
-    "MCE": "es",   # Bolsas y Mercados Españoles -> Spain
+    "MCE": "es",   # Bolsas y Mercados EspaÃ±oles -> Spain
     "STO": "se",   # Nasdaq OMX Stockholm -> Sweden
     "SWX": "ch",   # SIX Swiss Exchange -> Switzerland
     "LON": "gb",   # London Stock Exchange -> United Kingdom

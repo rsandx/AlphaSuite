@@ -282,8 +282,9 @@ class Company(Base):
 class PriceHistory(Base):
     __tablename__ = "price_history"
     id = Column(Integer, Sequence('price_history_id_seq', start=1, increment=1), primary_key=True)
-    company_id = Column(Integer, ForeignKey("company.id"))
-    date = Column(Date, index=True)
+    company_id = Column(Integer, ForeignKey("company.id"), index=True)
+    timestamp = Column(DateTime, index=True, nullable=False)
+    timeframe = Column(String(10), index=True, nullable=False, server_default='1d') # e.g., '1d', '1h', '15m'
     open = Column(Float)
     high = Column(Float)
     low = Column(Float)
@@ -295,7 +296,7 @@ class PriceHistory(Base):
 
     # Define unique constraint
     __table_args__ = (
-        UniqueConstraint('company_id', 'date', name='uq_company_id_date'),
+        UniqueConstraint('company_id', 'timeframe', 'timestamp', name='uq_company_timeframe_timestamp'),
     )
     # Relationships
     company = relationship("Company", back_populates="price_histories")
@@ -494,3 +495,35 @@ class InsiderRoster(Base):
 
     __table_args__ = (UniqueConstraint('company_id', 'name', 'position', name='uq_insider_roster_key'),)
     company = relationship("Company", back_populates="insider_rosters")
+
+
+
+""" Script for migrating the date column of PriceHistory to timestamp and timeframe
+-- Step 1: Add the new columns
+ALTER TABLE price_history 
+    ADD COLUMN "timestamp" TIMESTAMP WITHOUT TIME ZONE,
+    ADD COLUMN timeframe VARCHAR(10);
+
+-- Step 2: Populate the new columns
+UPDATE price_history 
+SET timeframe = '1d', 
+    "timestamp" = date::timestamp;
+
+-- Step 3: Enforce NOT NULL
+ALTER TABLE price_history 
+    ALTER COLUMN "timestamp" SET NOT NULL,
+    ALTER COLUMN timeframe SET NOT NULL;
+
+-- Step 4: Drop old objects
+DROP INDEX IF EXISTS ix_price_history_date;
+ALTER TABLE price_history DROP CONSTRAINT IF EXISTS uq_company_id_date;
+ALTER TABLE price_history DROP COLUMN date;
+
+-- Step 5: Create new indexes & constraint
+CREATE INDEX ix_price_history_company_id ON price_history (company_id);
+CREATE INDEX ix_price_history_timeframe ON price_history (timeframe);
+CREATE INDEX ix_price_history_timestamp ON price_history ("timestamp");
+
+ALTER TABLE price_history 
+    ADD CONSTRAINT uq_company_timeframe_timestamp UNIQUE (company_id, timeframe, "timestamp");
+"""

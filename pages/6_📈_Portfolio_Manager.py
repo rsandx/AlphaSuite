@@ -119,7 +119,7 @@ else:
             ),
             "current_stop_loss": st.column_config.NumberColumn("Current Stop", format="$%.2f"),
         },
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
 st.markdown("---")
@@ -153,8 +153,8 @@ with st.expander("➕ Add New Position"):
                     st.error(f"Failed to add position: {e}")
                     st.code(traceback.format_exc())
 
-if not positions_df.empty:
-    with st.expander("➖ Close Position", disabled=DEMO_MODE):
+if not positions_df.empty and not DEMO_MODE:
+    with st.expander("➖ Close Position", expanded=True):
         with st.form("close_position_form", clear_on_submit=True):
             position_to_close = st.selectbox(
                 "Select Ticker to Close",
@@ -175,7 +175,7 @@ if not positions_df.empty:
                     except Exception as e:
                         st.error(f"Failed to close position: {e}")
 
-if st.button("⚙️ Check & Manage All Positions", use_container_width=True, disabled=DEMO_MODE):
+if st.button("⚙️ Check & Manage All Positions", width='stretch', disabled=DEMO_MODE):
     with st.spinner("Checking positions..."):
         try:
             string_io = io.StringIO()

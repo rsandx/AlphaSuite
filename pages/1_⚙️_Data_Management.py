@@ -48,7 +48,7 @@ with tab1:
     if st.session_state.pipeline_finished_message:
         st.success(st.session_state.pipeline_finished_message)
 
-    if st.button("Start Daily Pipeline", use_container_width=True, disabled=is_running_pipeline or DEMO_MODE):
+    if st.button("Start Daily Pipeline", width='stretch', disabled=is_running_pipeline or DEMO_MODE):
         st.session_state.pipeline_finished_message = None # Clear previous message
         st.session_state.pipeline_logs = [f"[{datetime.now().strftime('%H:%M:%S')}] Starting daily pipeline process..."]
 
@@ -113,7 +113,7 @@ with tab2:
         existing_tickers_action = c1.selectbox("Action for Existing Tickers", ["skip", "only", "include"], help="`skip`: skip existing tickers. `only`: only process existing tickers. `include`: process all tickers.", disabled=is_running)
         update_prices_action = c2.selectbox("Update Prices Action", ["yes", "no", "last_day", "only"], help="`yes`: update both company info and prices. `no`: skip price updates. `last_day`: update only the last day's prices. `only`: only update prices, skip company info.", disabled=is_running)
 
-        run_download = st.form_submit_button("Run Download/Update", use_container_width=True, disabled=is_running or DEMO_MODE)
+        run_download = st.form_submit_button("Run Download/Update", width='stretch', disabled=is_running or DEMO_MODE)
 
     if run_download and not st.session_state.full_download_process:
         st.session_state.full_download_finished_message = None
@@ -216,7 +216,7 @@ with tab3:
         start_date = c1.date_input("Start Date", value=st.session_state.range_start_date, disabled=is_running_range)
         end_date = c2.date_input("End Date", value=today, disabled=is_running_range)
 
-        run_range_download_button = st.form_submit_button("Run Range Download", use_container_width=True, disabled=is_running_range or DEMO_MODE)
+        run_range_download_button = st.form_submit_button("Run Range Download", width='stretch', disabled=is_running_range or DEMO_MODE)
 
     if run_range_download_button and not st.session_state.range_download_process:
         st.session_state.range_download_finished_message = None
@@ -428,10 +428,10 @@ with tab4:
                                 strong_stocks = item.get('strongest_stocks', [])
                                 if strong_stocks:
                                     df = pd.DataFrame(strong_stocks)
-                                    st.dataframe(df, use_container_width=True, hide_index=True)
+                                    st.dataframe(df, width='stretch', hide_index=True)
                         else:
                             st.success(f"Found {len(results)} passing stocks.")
-                            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(results), width='stretch', hide_index=True)
                     except (IndexError, KeyError, TypeError):
                             st.warning("Scanner ran but returned results in an unexpected format.")
                             st.write(results)

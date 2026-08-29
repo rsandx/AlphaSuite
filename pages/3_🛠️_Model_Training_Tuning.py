@@ -1,4 +1,5 @@
 import os
+import pickle
 import streamlit as st
 import pandas as pd
 import logging
@@ -11,11 +12,14 @@ import time
 from load_cfg import DEMO_MODE
 from pybroker_trainer.strategy_loader import get_strategy_class_map, get_strategy_defaults, load_strategy_class
 from quant_engine import (
+    find_model_version_dirs,
+    get_available_backtest_runs,
     run_pybroker_walkforward,
     run_tune_strategy,
     run_visualize_model,
     run_quick_test
 )
+from tools.yfinance_tool import TIMEFRAME_OPTIONS
 
 st.set_page_config(page_title="Model Training & Tuning", layout="wide")
 st.title("🛠️ Model Training & Tuning")
@@ -79,6 +83,7 @@ def run_tuning_in_thread(params, log_q, progress_q, stop_event):
             max_drawdown=params['max_drawdown'],
             min_trades=params['min_trades'],
             min_win_rate=params['min_win_rate'],
+            timeframe_override=params['timeframe'],
             progress_callback=progress_callback,
             stop_event_checker=lambda: stop_event.is_set()
         )
@@ -112,10 +117,11 @@ with tune_tab:
     # Show form only if tuning is not in progress
     if not st.session_state.tuning_in_progress:
         with st.form("tune_form"):
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             ticker_tune = c1.text_input("Ticker", "SPY").upper()
             strategy_type_tune = c2.selectbox("Strategy Type", strategy_options, key="tune_strat")
-            n_calls_tune = c3.number_input("Tuning Iterations (n_calls)", min_value=10, max_value=200, value=50)
+            timeframe_tune = c3.selectbox("Timeframe", TIMEFRAME_OPTIONS, key="tune_tf")
+            n_calls_tune = c4.number_input("Tuning Iterations (n_calls)", min_value=10, max_value=200, value=50)
 
             c1, c2 = st.columns(2)
             start_date_tune = c1.date_input("Start Date", datetime(2000, 1, 1), key="tune_start")
@@ -128,13 +134,13 @@ with tune_tab:
             min_trades_tune = c3.number_input("Min Trades", value=20)
             min_win_rate_tune = c4.number_input("Min Win Rate (%)", value=40.0)
 
-            run_tuning = st.form_submit_button("Run Tuning", use_container_width=True, disabled=DEMO_MODE)
+            run_tuning = st.form_submit_button("Run Tuning", width='stretch', disabled=DEMO_MODE)
 
             if run_tuning:
                 st.session_state.tuning_in_progress = True
                 # Store params in session state to use them after the rerun
                 st.session_state.tune_params = {
-                    "ticker": ticker_tune, "strategy_type": strategy_type_tune, "n_calls": n_calls_tune,
+                    "ticker": ticker_tune, "strategy_type": strategy_type_tune, "timeframe": timeframe_tune, "n_calls": n_calls_tune,
                     "start_date": start_date_tune, "end_date": end_date_tune, "commission": commission_tune,
                     "max_drawdown": max_drawdown_tune, "min_trades": min_trades_tune, "min_win_rate": min_win_rate_tune,
                 }
@@ -157,7 +163,7 @@ with tune_tab:
             st.session_state.tuning_thread = thread
             thread.start()
 
-        if st.button("Stop Tuning Process", use_container_width=True, type="primary"):
+        if st.button("Stop Tuning Process", width='stretch', type="primary"):
             if st.session_state.stop_event:
                 st.session_state.stop_event.set()
             st.warning("Stop signal sent. The process will halt after the current iteration.")
@@ -209,17 +215,19 @@ def run_training_in_thread(params, log_q, stop_event):
     root_logger = logging.getLogger()
     root_logger.addHandler(qh)
     try:
-        run_pybroker_walkforward(
+        result, _, _ = run_pybroker_walkforward(
             ticker=params['ticker'],
             strategy_type=params['strategy_type'],
+            timeframe_override=params['timeframe'],
+            model_n_calls=params['model_n_calls'],
             start_date=params['start_date'].strftime('%Y-%m-%d'),
             end_date=params['end_date'].strftime('%Y-%m-%d'),
             tune_hyperparameters=params['tune_hyperparams'],
-            plot_results=False, # We will plot in Streamlit
             save_assets=True,
-            use_tuned_strategy_params=params['use_tuned_params'],
+            use_tuned_strategy_params=params['use_tuned_strategy_params'],
+            model_version=params['model_version'],
             commission_cost=params['commission'],
-            stop_event_checker=lambda: stop_event.is_set()
+            stop_event_checker=lambda: stop_event.is_set(),
         )
     finally:
         # Important to remove the handler to avoid duplicate logs on subsequent runs
@@ -237,32 +245,75 @@ with train_tab:
             st.warning(message)
         st.session_state.completion_message_train = None # Clear the message
 
+    ticker, strat, timeframe = None, None, None
+
     # Show form only if training is not in progress
     if not st.session_state.training_in_progress:
-        with st.form("train_form"):
-            c1, c2, c3 = st.columns(3)
-            ticker_train = c1.text_input("Ticker", "SPY", key="train_ticker").upper()
-            strategy_type_train = c2.selectbox("Strategy Type", strategy_options, key="train_strat")
-            commission_train = c3.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="train_comm")
+        c1, c2, c3, c4 = st.columns([1,1,1,1])
+        ticker_train = c1.text_input("Ticker", ticker if ticker else "SPY", key="train_ticker").upper()
+        strategy_type_train = c2.selectbox("Strategy Type", strategy_options, index=strategy_options.index(strat) if strat else 0, key="train_strat")
+        timeframe_train = c3.selectbox("Timeframe", TIMEFRAME_OPTIONS, index=TIMEFRAME_OPTIONS.index(timeframe) if timeframe else 0, key="train_tf")
+        model_n_calls_train = c4.number_input(
+            "Model Tuning Iterations",
+            min_value=10, max_value=100, value=32,
+            help="Number of iterations for model hyperparameter tuning. Only used if 'Tune Model Hyperparameters?' is checked."
+        )
+
+        c1, c2, c3 = st.columns(3)
+        start_date_train = c1.date_input("Start Date", datetime(2000, 1, 1), key="train_start")
+        end_date_train = c2.date_input("End Date", datetime.now(), key="train_end")
+        commission_train = c3.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="train_comm")
+
+        st.markdown("---")
+        st.markdown("##### Parameter & Versioning Configuration")
+        c1, c2 = st.columns([1,2])
+        with c1:
+            use_tuned_strategy_params_train = st.checkbox(
+                "Use Tuned Strategy Params?",
+                value=True,
+                help="Use the best high-level parameters found during the 'Tune Strategy' step."
+            )
+            tune_model_hyperparams = st.checkbox(
+                "Tune Model Hyperparameters?",
+                value=True,
+                help="Only applicable for Machine Learning-based strategies (e.g., those using LGBM)."
+            )
+
+        versions_train = []
+        show_version_selector = use_tuned_strategy_params_train
+        if show_version_selector:
+            full_version_dirs = find_model_version_dirs(ticker_train, strategy_type_train, timeframe_train)
+            if full_version_dirs:
+                prefix_new = f"{ticker_train}_{strategy_type_train}_{timeframe_train}_"
+                prefix_legacy = f"{ticker_train}_{strategy_type_train}_"
+                for d in full_version_dirs:
+                    if d.startswith(prefix_new):
+                        versions_train.append(d.replace(prefix_new, ''))
+                    elif d.startswith(prefix_legacy):
+                        versions_train.append(d.replace(prefix_legacy, ''))
+                versions_train.sort(reverse=True) # Sort in descending order
     
-            c1, c2 = st.columns(2)
-            start_date_train = c1.date_input("Start Date", datetime(2000, 1, 1), key="train_start")
-            end_date_train = c2.date_input("End Date", datetime.now(), key="train_end")
-    
-            c1, c2 = st.columns(2)
-            use_tuned_params_train = c1.checkbox("Use Tuned Strategy Params?", value=True)
-            tune_model_hyperparams = c2.checkbox("Tune Model Hyperparameters?", value=True)
-    
-            run_training = st.form_submit_button("Run Training", use_container_width=True, disabled=DEMO_MODE)
-    
-            if run_training:
-                st.session_state.training_in_progress = True
-                st.session_state.train_params = {
-                    "ticker": ticker_train, "strategy_type": strategy_type_train, "commission": commission_train,
-                    "start_date": start_date_train, "end_date": end_date_train,
-                    "use_tuned_params": use_tuned_params_train, "tune_hyperparams": tune_model_hyperparams
-                }
-                st.rerun()
+        version_index = 0 # Default to the latest
+        with c2:
+            selected_version_train = st.selectbox(
+                "Select Parameter Version (optional)",
+                options=versions_train,
+                index=version_index if versions_train else None,
+                help="Select a specific version to load parameters from. If left blank, the latest version will be used.",
+                disabled=not show_version_selector
+            )
+
+        run_training = st.button("Run Training", width='stretch', disabled=DEMO_MODE)
+
+        if run_training:
+            st.session_state.training_in_progress = True
+            st.session_state.train_params = {
+                "ticker": ticker_train, "strategy_type": strategy_type_train, "timeframe": timeframe_train, "model_n_calls": model_n_calls_train,
+                "start_date": start_date_train, "end_date": end_date_train, "commission": commission_train,
+                "use_tuned_strategy_params": use_tuned_strategy_params_train, "tune_hyperparams": tune_model_hyperparams, 
+                "model_version": selected_version_train if show_version_selector else None
+            }
+            st.rerun()
     
     # This block runs when training_in_progress is True
     if st.session_state.training_in_progress:
@@ -280,7 +331,7 @@ with train_tab:
             st.session_state.training_thread = thread
             thread.start()
 
-        if st.button("Stop Training Process", use_container_width=True, type="primary"):
+        if st.button("Stop Training Process", width='stretch', type="primary"):
             if st.session_state.stop_event:
                 st.session_state.stop_event.set()
             st.warning("Stop signal sent. The process will halt at the next available checkpoint.")
@@ -327,6 +378,7 @@ def run_quick_test_in_thread(params, log_q, stop_event):
         results = run_quick_test(
             ticker=params['ticker'],
             strategy_type=params['strategy_type'],
+            timeframe_override=params['timeframe'],
             start_date=params['start_date'].strftime('%Y-%m-%d'),
             end_date=params['end_date'].strftime('%Y-%m-%d'),
             strategy_params=params['strategy_params'],
@@ -373,7 +425,7 @@ with quick_test_tab:
                         fi_df = pd.DataFrame(res['permutation_importances'])
                         st.dataframe(fi_df, hide_index=True)
 
-        if st.button("Run New Quick Test", use_container_width=True):
+        if st.button("Run New Quick Test", width='stretch'):
             st.session_state.quick_test_results = None
             st.rerun()
 
@@ -392,9 +444,10 @@ with quick_test_tab:
                 default_params_json = json.dumps(default_params, indent=4)
 
         with st.form("quick_test_form"):
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             ticker_qt = c1.text_input("Ticker", "SPY", key="qt_ticker").upper()
             commission_qt = c2.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="qt_comm")
+            timeframe_qt = c3.selectbox("Timeframe", TIMEFRAME_OPTIONS, key="qt_tf")
 
             c1, c2 = st.columns(2)
             start_date_qt = c1.date_input("Start Date", datetime(2000, 1, 1), key="qt_start")
@@ -403,7 +456,7 @@ with quick_test_tab:
             st.markdown("###### Override Strategy Parameters (JSON format)")
             params_override_text = st.text_area("Parameters", value=default_params_json, height=250, help="Enter a JSON object of parameters to override strategy defaults.")
 
-            run_qt = st.form_submit_button("Run Quick Test", use_container_width=True)
+            run_qt = st.form_submit_button("Run Quick Test", width='stretch')
 
             if run_qt:
                 import json
@@ -412,7 +465,7 @@ with quick_test_tab:
                     st.session_state.quick_test_in_progress = True
                     st.session_state.quick_test_params = {
                         "ticker": ticker_qt, "strategy_type": st.session_state.qt_strat_select, "commission": commission_qt,
-                        "start_date": start_date_qt, "end_date": end_date_qt,
+                        "start_date": start_date_qt, "end_date": end_date_qt, "timeframe": timeframe_qt,
                         "strategy_params": params_override
                     }
                     st.rerun()
@@ -428,7 +481,7 @@ with quick_test_tab:
             st.session_state.quick_test_thread = thread
             thread.start()
 
-        if st.button("Stop Quick Test", use_container_width=True, type="primary"):
+        if st.button("Stop Quick Test", width='stretch', type="primary"):
             if st.session_state.stop_event: st.session_state.stop_event.set()
             st.warning("Stop signal sent. The process will halt.")
 
@@ -470,42 +523,55 @@ with visualize_tab:
             st.session_state.viz_results = None
 
     # Get a list of all trained models from the pybroker_trainer artifacts directory
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    models_dir = os.path.join(project_root, 'pybroker_trainer', 'artifacts')
-    trained_models = []
-    if os.path.exists(models_dir):
-        for f in os.listdir(models_dir):
-            # The `_results.pkl` file is the one artifact guaranteed to exist for any trained strategy (ML or non-ML).
-            # We use this file to discover all available backtest results.
-            if f.endswith('_results.pkl'):
-                # Example filename: SPY_ma_crossover_results.pkl
-                parts = f.replace('_results.pkl', '').split('_')
-                if len(parts) >= 2:
-                    ticker = parts[0]
-                    strategy = "_".join(parts[1:])
-                    trained_models.append(f"{ticker} - {strategy}")
+    trained_models = get_available_backtest_runs()
 
     if not trained_models:
         st.warning("No trained models found in the pybroker_trainer artifacts directory. Please run the 'train' command first.")
         selected_model = None
+        selected_version_viz = None
     else:
-        selected_model = st.selectbox(
-            "Select a Trained Model to Visualize",
-            options=sorted(list(set(trained_models))), # Use set to remove duplicates
-            key="selected_model_viz", # Add a key for state management
-            on_change=clear_viz_results # Clear old results when selection changes
-        )
+        c1, c2 = st.columns(2)
+        with c1:
+            selected_model = st.selectbox(
+                "Select a Trained Model to Visualize",
+                options=trained_models,
+                key="selected_model_viz",
+                on_change=clear_viz_results
+            )
+        
+        ticker_viz, strategy_type_viz, timeframe = selected_model.split(' - ', 2) if selected_model else (None, None, None)
+        versions_viz = []
+        if ticker_viz and strategy_type_viz:
+            full_version_dirs = find_model_version_dirs(ticker_viz, strategy_type_viz, timeframe)
+            if full_version_dirs:
+                prefix_new = f"{ticker_viz}_{strategy_type_viz}_{timeframe}_"
+                prefix_legacy = f"{ticker_viz}_{strategy_type_viz}_"
+                for d in full_version_dirs:
+                    if d.startswith(prefix_new):
+                        versions_viz.append(d.replace(prefix_new, ''))
+                    elif d.startswith(prefix_legacy):
+                        versions_viz.append(d.replace(prefix_legacy, ''))
+                versions_viz.sort(reverse=True) # Sort in descending order
 
-    visualize_button = st.button("Load and Visualize", use_container_width=True, disabled=(not selected_model))
+        with c2:
+            selected_version_viz = st.selectbox(
+                "Select Model Version:",
+                options=versions_viz,
+                help="Select the timestamped version of the model to view.",
+                key="selected_model_version_viz",
+                on_change=clear_viz_results,
+                disabled=not versions_viz
+            )
 
-    if visualize_button and selected_model:
-        ticker, strategy_type = selected_model.split(' - ', 1)
-        with st.spinner(f"Loading artifacts and generating plots for {ticker} - {strategy_type}..."):
+    visualize_button = st.button("Load and Visualize", width='stretch', disabled=(not selected_version_viz))
+
+    if visualize_button and selected_model and selected_version_viz:
+        with st.spinner(f"Loading artifacts for {ticker_viz} - {strategy_type_viz} (version {selected_version_viz})..."):
             try:
-                viz_assets = run_visualize_model(ticker, strategy_type)
+                viz_assets = run_visualize_model(ticker_viz, strategy_type_viz, timeframe, selected_version_viz)
                 st.session_state.viz_results = viz_assets
                 if viz_assets is None:
-                    st.error(f"Could not load visualization assets for {ticker} - {strategy_type}. Check the logs. A common cause is missing artifact files (e.g., _results.pkl).")
+                    st.error(f"Could not load visualization assets for {ticker} - {strategy_type_viz}. Check the logs. A common cause is missing artifact files (e.g., _results.pkl).")
                 else:
                     st.success("Visualization assets loaded successfully.")
             except Exception as e:
@@ -514,7 +580,7 @@ with visualize_tab:
 
     if st.session_state.viz_results:
         # Add a button to clear results and go back to the selection form
-        if st.button("Clear Visualization & Select New Model", use_container_width=True):
+        if st.button("Clear Visualization & Select New Model", width='stretch'):
             st.session_state.viz_results = None
             st.rerun()
 

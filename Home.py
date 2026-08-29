@@ -3,6 +3,7 @@ import os
 import logging
 from dotenv import load_dotenv
 from core.db import get_db, initialize_database_schema
+from core.logging_config import setup_logging
 from core.model import Company
 from tools.yfinance_tool import load_ticker_data
 
@@ -10,7 +11,10 @@ from tools.yfinance_tool import load_ticker_data
 # This ensures that all modules have access to them when they are imported.
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+# --- Logging Configuration ---
+# Centralize logging setup by calling the function from the core module.
+setup_logging('home.log')
+logger = logging.getLogger(__name__)  # Get the logger for Home.py
 
 def initialize_app():
     """

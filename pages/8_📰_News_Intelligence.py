@@ -69,7 +69,7 @@ with tab1:
     if 'market_briefing_results' not in st.session_state:
         st.session_state.market_briefing_results = None
 
-    if st.button("Generate Latest Market Briefing", use_container_width=True, key="briefing_button"):
+    if st.button("Generate Latest Market Briefing", width='stretch', key="briefing_button"):
         with st.spinner("Fetching news and generating market briefing... This may take a while."):
             st.info("Displaying a sample Market Briefing Report. This feature is for demonstration purposes.")
             # Construct path to the sample report in the 'samples' directory at the project root
@@ -116,7 +116,7 @@ with tab2:
     if 'risk_analysis_results' not in st.session_state:
         st.session_state.risk_analysis_results = None
 
-    if st.button("Analyze News for Red Flags", use_container_width=True, key="risk_button"):
+    if st.button("Analyze News for Red Flags", width='stretch', key="risk_button"):
         if not selected_profile_names:
             st.warning("Please select at least one risk profile to analyze.")
             st.stop()

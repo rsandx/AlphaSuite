@@ -10,6 +10,7 @@ from quant_engine import (
     get_default_tickers,
     plot_performance_vs_benchmark
 )
+from tools.yfinance_tool import TIMEFRAME_OPTIONS
 
 st.set_page_config(page_title="Portfolio Analysis", layout="wide")
 st.title("🔬 Portfolio Analysis")
@@ -40,15 +41,16 @@ with scan_tab:
         default_tickers_str = ",".join(get_default_tickers(source=2, limit=100))
         tickers_prescan = st.text_area("Tickers to Scan (comma-separated)", value=default_tickers_str, height=150)
         
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         strategy_type_prescan = c1.selectbox("Strategy Type", strategy_options, key="prescan_strat")
-        min_setups_prescan = c2.number_input("Minimum Historical Setups", min_value=5, value=60)
+        timeframe_prescan = c2.selectbox("Timeframe", TIMEFRAME_OPTIONS, key="prescan_tf")
+        min_setups_prescan = c3.number_input("Minimum Historical Setups", min_value=5, value=60)
 
         c1, c2 = st.columns(2)
         start_date_prescan = c1.date_input("Start Date", datetime(2000, 1, 1), key="prescan_start")
         end_date_prescan = c2.date_input("End Date", datetime.now(), key="prescan_end")
 
-        run_prescan = st.form_submit_button("Run Pre-Scan", use_container_width=True, disabled=DEMO_MODE)
+        run_prescan = st.form_submit_button("Run Pre-Scan", width='stretch', disabled=DEMO_MODE)
 
     if run_prescan:
         progress_bar = st.progress(0)
@@ -64,6 +66,7 @@ with scan_tab:
             valid_tickers, counts = run_pre_scan_universe(
                 tickers=",".join(ticker_list),
                 strategy_type=strategy_type_prescan,
+                timeframe_override=timeframe_prescan,
                 min_setups=min_setups_prescan,
                 start_date=start_date_prescan.strftime('%Y-%m-%d'),
                 end_date=end_date_prescan.strftime('%Y-%m-%d'),
@@ -88,7 +91,7 @@ with scan_tab:
                 'Ticker': valid_tickers,
                 'Setup Count': [counts[t] for t in valid_tickers]
             })
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, width='stretch', hide_index=True)
             
             st.info(f"You can copy these tickers for the Portfolio Backtest tab: `{st.session_state.prescan_results}`")
         else:
@@ -100,10 +103,11 @@ with backtest_tab:
         # Pre-populate with results from pre-scan if available
         tickers_portfolio = st.text_area("Tickers for Portfolio (comma-separated)", value=st.session_state.prescan_results, height=150, key="portfolio_tickers")
         
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         strategy_type_portfolio = c1.selectbox("Strategy Type", strategy_options, key="portfolio_strat")
-        max_open_positions = c2.number_input("Max Open Positions", min_value=1, value=5)
-        commission_portfolio = c3.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="portfolio_comm")
+        timeframe_portfolio = c2.selectbox("Timeframe", TIMEFRAME_OPTIONS, key="portfolio_tf")
+        max_open_positions = c3.number_input("Max Open Positions", min_value=1, value=5)
+        commission_portfolio = c4.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="portfolio_comm")
 
         c1, c2 = st.columns(2)
         start_date_portfolio = c1.date_input("Start Date", datetime(2000, 1, 1), key="portfolio_start")
@@ -111,7 +115,7 @@ with backtest_tab:
 
         use_tuned_params_portfolio = st.checkbox("Use Tuned Strategy Params?", value=True, key="portfolio_tuned_params")
 
-        run_portfolio_backtest = st.form_submit_button("Run Portfolio Backtest", use_container_width=True, disabled=DEMO_MODE)
+        run_portfolio_backtest = st.form_submit_button("Run Portfolio Backtest", width='stretch', disabled=DEMO_MODE)
 
     if run_portfolio_backtest:
         if not tickers_portfolio:
@@ -144,6 +148,7 @@ with backtest_tab:
                     result = run_pybroker_portfolio_backtest(
                         tickers=ticker_list_portfolio,
                         strategy_type=strategy_type_portfolio,
+                        timeframe_override=timeframe_portfolio,
                         start_date=start_date_portfolio.strftime('%Y-%m-%d'),
                         end_date=end_date_portfolio.strftime('%Y-%m-%d'),
                         max_open_positions=max_open_positions,
@@ -157,7 +162,7 @@ with backtest_tab:
                 if result:
                     st.subheader("Portfolio Performance Metrics")
                     metrics_display_df = result.metrics_df.astype(str)
-                    st.dataframe(metrics_display_df, use_container_width=True)
+                    st.dataframe(metrics_display_df, width='stretch')
 
                     st.subheader("Portfolio Equity Curve")
                     fig_equity = plot_performance_vs_benchmark(result, f'Portfolio Equity for {strategy_type_portfolio}')

@@ -1,15 +1,15 @@
 import streamlit as st
 from datetime import datetime
 import traceback
-import os
 
 # Import the necessary functions from your backtesting engine
 from quant_engine import (
+    find_model_version_dirs,
+    get_available_backtest_runs,
     run_pybroker_full_backtest,
     plot_performance_vs_benchmark,
     plot_trades_on_chart
 )
-from load_cfg import WORKING_DIRECTORY
 
 st.set_page_config(page_title="Interactive Backtester", layout="wide")
 
@@ -35,52 +35,55 @@ def clear_bt_results():
     if 'bt_artifacts' in st.session_state:
         st.session_state.bt_artifacts = None
 
-def get_available_trained_models():
-    """Scans the models directory and returns a list of available ticker/strategy combinations."""
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    models_dir = os.path.join(project_root, 'pybroker_trainer', 'artifacts')
-    if not os.path.exists(models_dir):
-        return []
+available_models = get_available_backtest_runs()
 
-    available_models = []
-    for f in os.listdir(models_dir):
-        # The `_results.pkl` file is the one artifact guaranteed to exist for any trained strategy (ML or non-ML).
-        # We use this file to discover all available backtest results.
-        if f.endswith('_results.pkl'):
-            # Example filename: SPY_ma_crossover_results.pkl
-            parts = f.replace('_results.pkl', '').split('_')
-            if len(parts) >= 2:
-                ticker = parts[0]
-                strategy = "_".join(parts[1:])
-                available_models.append(f"{ticker} - {strategy}")
-    return sorted(available_models)
+col11, col12 = st.columns([2, 2])
 
-available_models = get_available_trained_models()
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
+with col11:
     selected_model = st.selectbox(
         "Select a Trained Model (Ticker & Strategy):",
         options=available_models,
-        help="This list is populated from trained models found in the `models/` directory.",
+        help="This list is populated from completed backtest runs found in the database.",
         key="selected_model_bt",
         on_change=clear_bt_results
     )
 
-with col2:
-    commission_input = st.number_input(
-        "Commission (per share):",
-        min_value=0.0,
-        value=0.005,
-        step=0.001,
-        format="%.4f",
-        key="commission_bt",
-        on_change=clear_bt_results
+if selected_model:
+    parts = selected_model.split(' - ')
+    if len(parts) == 3:
+        ticker_input, strategy_select, timeframe = parts
+    else:
+        ticker_input, strategy_select = parts[0], parts[1]
+        timeframe = '1d' # Default fallback
+else:
+    ticker_input, strategy_select, timeframe = None, None, None
+
+versions = []
+if ticker_input and strategy_select:
+    full_version_dirs = find_model_version_dirs(ticker_input, strategy_select, timeframe)
+    if full_version_dirs:
+        prefix_new = f"{ticker_input}_{strategy_select}_{timeframe}_"
+        prefix_legacy = f"{ticker_input}_{strategy_select}_"
+        for d in full_version_dirs:
+            if d.startswith(prefix_new):
+                versions.append(d.replace(prefix_new, ''))
+            elif d.startswith(prefix_legacy):
+                versions.append(d.replace(prefix_legacy, ''))
+        versions.sort(reverse=True) # Sort in descending order
+
+with col12:
+    selected_version = st.selectbox(
+        "Select Model Version:",
+        options=versions,
+        help="Select the timestamped version of the model to view. This list is populated from the artifacts directory.",
+        key="selected_model_version_bt",
+        on_change=clear_bt_results,
+        disabled=not versions
     )
 
-col3, col4, col5 = st.columns([1, 1, 2])
-with col3:
+col21, col22 = st.columns([2, 2])
+
+with col21:
     start_date_input = st.date_input(
         "Start Date",
         value=datetime(2000, 1, 1),
@@ -88,38 +91,41 @@ with col3:
         on_change=clear_bt_results
     )
 
-with col4:
+with col22:
     end_date_input = st.date_input(
         "End Date", value=datetime.now(), key="end_date_bt", on_change=clear_bt_results
     )
 
-with col5:
+c31, c32 = st.columns([2, 2])
+with c31:
+    commission_input = st.number_input("Commission ($ per share)", value=0.0, format="%.4f", key="commission_bt", on_change=clear_bt_results, help="Override the commission used for this specific backtest run.")
+
+with c32:
     st.write("") # Spacer
-    st.write("") # Spacer
-    run_button = st.button("🚀 Run Backtest", use_container_width=True, disabled=not available_models)
+    run_button = st.button("🚀 Run Backtest", width='stretch', disabled=not selected_version)
 
 # --- Main Logic ---
 if run_button:
-    if not selected_model:
-        st.warning("No trained models available to run a backtest.")
+    if not selected_model or not selected_version:
+        st.warning("Please select a model and a version to run the backtest.")
         st.session_state.bt_artifacts = None
     else:
-        ticker_input, strategy_select = selected_model.split(' - ', 1)
-
         with st.spinner(f"Running backtest for {ticker_input} with {strategy_select} strategy..."):
             try:
                 backtest_artifacts = run_pybroker_full_backtest(
                     ticker=ticker_input,
                     strategy_type=strategy_select,
+                    model_version=selected_version,
                     start_date=start_date_input.strftime('%Y-%m-%d'),
                     end_date=end_date_input.strftime('%Y-%m-%d'),
-                    commission_cost=commission_input
+                    commission_cost=commission_input,
+                    timeframe_override=timeframe
                 )
                 st.session_state.bt_artifacts = backtest_artifacts
                 st.session_state.bt_ticker = ticker_input # Save for display
                 st.session_state.bt_strategy = strategy_select # Save for display
                 if backtest_artifacts is None:
-                    st.error(f"Backtest failed. This usually means a model for '{ticker_input}' with strategy '{strategy_select}' has not been trained yet. Please run the `train` command first.")
+                    st.error(f"Backtest failed. This usually means a model for '{ticker_input}' with strategy '{strategy_select}' has not been trained yet or failed to train.")
             except Exception as e:
                 st.error(f"An unexpected error occurred during the backtest: {e}")
                 st.code(traceback.format_exc())
@@ -142,11 +148,11 @@ if st.session_state.bt_artifacts:
         # (e.g., numbers and datetimes), which causes pyarrow serialization errors.
         # We convert the entire DataFrame to strings for robust display.
         metrics_display_df = result.metrics_df.astype(str)
-        st.dataframe(metrics_display_df, use_container_width=True)
+        st.dataframe(metrics_display_df, width='stretch')
 
     with tab2:
         # --- Use a standard if/else block to prevent printing the DeltaGenerator object ---
-        fig_equity = plot_performance_vs_benchmark(result, f"Equity Curve for {ticker} ({strategy})")
+        fig_equity = plot_performance_vs_benchmark(result, title=f"Equity Curve for {ticker} ({strategy})", timeframe=timeframe)
         if fig_equity:
             st.pyplot(fig_equity)
         else:
@@ -154,7 +160,7 @@ if st.session_state.bt_artifacts:
 
     with tab3:
         # --- Use a standard if/else block to prevent printing the DeltaGenerator object ---
-        fig_trades = plot_trades_on_chart(result, ticker, f"Trades for {ticker} ({strategy})")
+        fig_trades = plot_trades_on_chart(result, ticker, title=f"Trades for {ticker} ({strategy})", timeframe=timeframe)
         if fig_trades:
             st.pyplot(fig_trades)
         else:

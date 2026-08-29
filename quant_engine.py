@@ -48,18 +48,20 @@ from dataclasses import asdict, replace
 import matplotlib.pyplot as plt
 import traceback
 
-from core.db import get_db
-from core.model import Company, PriceHistory
 from tools.file_wrapper import convert_to_json_serializable
-from tools.yfinance_tool import get_earnings_dates, load_ticker_data
+from tools.yfinance_tool import get_earnings_dates, load_price_data, load_ticker_data
 from pybroker_trainer.strategy_loader import load_strategy_class, get_strategy_defaults, get_strategy_tuning_space, STRATEGY_CLASS_MAP
-from pybroker_trainer.config_loader import load_strategy_config
 from load_cfg import WORKING_DIRECTORY
 from core.logging_config import setup_logging
 
 # --- Logging Configuration ---
 setup_logging('quant_engine.log')
 logger = logging.getLogger(__name__)
+
+# --- Global Constants ---
+MODEL_DIR = os.path.join('pybroker_trainer', 'artifacts')
+os.makedirs(MODEL_DIR, exist_ok=True)
+FULL_HISTORY_START_DATE = '2000-01-01'
 
 class PassThroughModel:
     """A dummy model that always predicts a high probability for the positive class."""
@@ -88,51 +90,7 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return json.JSONEncoder.default(self, obj)
 
-def _load_price_data(ticker: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """
-    Loads historical price data for the ticker from the database.
-    """
-    db_session = next(get_db())
-    try:
-        company = db_session.query(Company).filter(Company.symbol == ticker).first()
-        if not company:
-            logger.error(f"Company with ticker {ticker} not found in database.")
-            return pd.DataFrame()
-
-        query = db_session.query(PriceHistory).filter(PriceHistory.company_id == company.id)
-        if start_date:
-            query = query.filter(PriceHistory.date >= start_date)
-        if end_date:
-            query = query.filter(PriceHistory.date <= end_date)
-        query = query.order_by(PriceHistory.date.asc())
-
-        price_data = pd.read_sql(query.statement, db_session.bind) 
-        
-        if price_data.empty:
-            logger.warning(f"No price data found for {ticker} between {start_date} and {end_date}.")
-            return pd.DataFrame()
-
-        # Ensure essential columns are present
-        for col in ['open', 'high', 'low', 'close', 'adjclose', 'volume']:
-            if col not in price_data.columns:
-                logger.error(f"Essential column '{col}' missing from price data for {ticker}.")
-                return pd.DataFrame()
-        
-        price_data['date'] = pd.to_datetime(price_data['date'])
-        if price_data['date'].dt.tz is not None:
-            price_data['date'] = price_data['date'].dt.tz_localize(None)
-        price_data.set_index('date', inplace=True)
-        
-        logger.info(f"Loaded {len(price_data)} data points for {ticker}.")
-        return price_data
-    except Exception as e:
-        logger.error(f"Error loading price data for {ticker}: {e}")
-        return pd.DataFrame()
-    finally:
-        if db_session and db_session.is_active:
-            db_session.close()
-
-def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_params: dict) -> pd.DataFrame:
+def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_params: dict, timeframe: str = '1d') -> pd.DataFrame:
     """
     Performs the initial, static data loading and feature calculation.
     This includes loading price data, calculating seasonality, and fetching earnings.
@@ -140,7 +98,7 @@ def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_par
     """
     logger.info(f"Preparing base data for {ticker} from {start_date} to {end_date}...")
     
-    data_df = _load_price_data(ticker, start_date, end_date)
+    data_df = load_price_data(ticker, start_date, end_date, timeframe)
     if data_df.empty:
         logger.error(f"No data found for {ticker} between {start_date} and {end_date}. Returning empty DataFrame.")
         return pd.DataFrame()
@@ -289,7 +247,7 @@ def _calculate_drawdown(series: pd.Series) -> pd.Series:
     drawdown = (series - cumulative_max) / cumulative_max
     return drawdown * 100  # Return as a percentage
 
-def plot_performance_vs_benchmark(result: TestResult, title: str, ticker: Optional[str] = None) -> Optional[plt.Figure]:
+def plot_performance_vs_benchmark(result: TestResult, title: str, ticker: Optional[str] = None, timeframe: str = '1d'):
     """
     Generates a plot to analyze strategy performance.
 
@@ -317,12 +275,23 @@ def plot_performance_vs_benchmark(result: TestResult, title: str, ticker: Option
         start_date = result.start_date.strftime('%Y-%m-%d')
         end_date = result.end_date.strftime('%Y-%m-%d')
         logger.info(f"Loading benchmark data for {benchmark_ticker}...")
-        data_dict = load_ticker_data(benchmark_ticker, start_date, end_date)
+        data_dict = load_ticker_data(benchmark_ticker, start_date, end_date, timeframe)
         if data_dict and 'shareprices' in data_dict and not data_dict['shareprices'].empty:
             price_data = data_dict['shareprices']
+            price_data = price_data.set_index('Date')
             initial_capital = portfolio_df['market_value'].iloc[0]
-            benchmark_series = price_data['Adj Close']
-            portfolio_dates = portfolio_df.index
+    
+            # 1. Get the series
+            benchmark_series = price_data['Adj Close'].copy()
+             
+            # 2. Fix the index type safely
+            # We access the index directly, convert to datetime, and strip timezone info
+            benchmark_series.index = pd.to_datetime(benchmark_series.index).tz_localize(None)
+            
+            # 3. Ensure portfolio_dates is also datetime and timezone-naive
+            portfolio_dates = pd.to_datetime(portfolio_df.index).tz_localize(None)
+            
+            # 4. Now the reindex will work perfectly
             benchmark_series = benchmark_series.reindex(portfolio_dates, method='ffill').dropna()
             if not benchmark_series.empty:
                 normalized_benchmark = (benchmark_series / benchmark_series.iloc[0]) * initial_capital
@@ -429,7 +398,7 @@ def _calculate_annualized_ratio(daily_ratio: float | None, timeframe: str = '1d'
     factor = annualization_factors.get(timeframe, 252) # Default to daily
     return float(daily_ratio * np.sqrt(factor))
 
-def plot_trades_on_chart(result: TestResult, ticker: str, title: str) -> Optional[plt.Figure]:
+def plot_trades_on_chart(result: TestResult, ticker: str, timeframe: str, title: str) -> Optional[plt.Figure]:
     """
     Plots the executed trades on top of the price chart to visualize strategy behavior.
     Returns the matplotlib Figure object.
@@ -444,7 +413,7 @@ def plot_trades_on_chart(result: TestResult, ticker: str, title: str) -> Optiona
     start_date = result.start_date.strftime('%Y-%m-%d')
     end_date = result.end_date.strftime('%Y-%m-%d')
     
-    data_dict = load_ticker_data(ticker, start_date, end_date)
+    data_dict = load_ticker_data(ticker, start_date, end_date, timeframe)
     if not data_dict or 'shareprices' not in data_dict or data_dict['shareprices'] is None:
         logger.error(f"Could not load price data for {ticker} to plot trades.")
         return None
@@ -516,29 +485,40 @@ def plot_feature_importance(feature_names, all_importances, top_n=20) -> Optiona
     plt.tight_layout() # Adjust layout to make room for labels
     return fig
 
-def run_visualize_model(ticker: str, strategy_type: str) -> Optional[Dict]:
+def run_visualize_model(ticker: str, strategy_type: str, timeframe: str, version: Optional[str]) -> Optional[Dict]:
     """
     Loads saved model artifacts from a 'train' run and generates visualization assets.
 
     Args:
         ticker: The stock ticker symbol.
         strategy_type: The strategy type.
+        timeframe: The timeframe, e.g. 1d, 1h.
+        version: The timestamped version.
 
     Returns:
         A dictionary containing DataFrames and matplotlib Figures for UI display,
         or None if artifacts cannot be loaded.
     """
     logger.info(f"--- Visualizing Results for {ticker} with {strategy_type} strategy ---")
-    model_dir = os.path.join('pybroker_trainer', 'artifacts')
+
+    if version:
+        model_dir = get_model_path(ticker, strategy_type, timeframe, version)
+    else:
+        model_dir = find_latest_model_version_dir(ticker, strategy_type, timeframe)
+    if not model_dir:
+        # Error already logged in helper function
+        logger.error(f"Could not find any saved model artifacts for {ticker}-{strategy_type}. Please run the 'train' command first.")
+        return None
     
     # --- Construct file paths ---
-    results_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_results.pkl')
-    features_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_features.json')
-    importances_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_importances.pkl') # type: ignore
-    model_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_params.json')
-    strategy_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_strategy_params.json')
+    results_filename = os.path.join(model_dir, 'results.pkl')
+    features_filename = os.path.join(model_dir, 'features.json')
+    importances_filename = os.path.join(model_dir, 'importances.pkl')
+    model_params_filename = os.path.join(model_dir, 'model_hyperparameters.json')
+    strategy_params_filename = os.path.join(model_dir, 'strategy_params.json') # This is the strategy_params used for that specific run
+    metadata_filename = os.path.join(model_dir, 'metadata.json') # Metadata file
 
-    # --- Load artifacts, handling missing files gracefully for non-ML strategies ---
+    # --- Load artifacts, handling missing files gracefully ---
     try:
         # The results file is mandatory for any visualization.
         with open(results_filename, 'rb') as f: result = pickle.load(f)
@@ -561,17 +541,7 @@ def run_visualize_model(ticker: str, strategy_type: str) -> Optional[Dict]:
     if os.path.exists(strategy_params_filename):
         with open(strategy_params_filename, 'r') as f: best_strategy_params = json.load(f)
 
-    # --- Check for the annualization flag in the correct file ---
-    # The flag is saved in `_best_strategy_params.json` during a tune run,
-    # and in `_strategy_params.json` during a regular train run. We need to check both.
-    params_to_check = best_strategy_params
-    if not params_to_check:
-        # Fallback to the regular strategy params file if the 'best' one doesn't exist
-        regular_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_strategy_params.json')
-        if os.path.exists(regular_params_filename):
-            with open(regular_params_filename, 'r') as f: params_to_check = json.load(f)
-
-    if params_to_check and params_to_check.get('ratios_annualized'):
+    if best_strategy_params and best_strategy_params.get('ratios_annualized'):
         metrics_df = result.metrics_df  # Ratios are already annualized.
     else:
         metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d') # Legacy file, annualize on-the-fly.
@@ -589,14 +559,111 @@ def run_visualize_model(ticker: str, strategy_type: str) -> Optional[Dict]:
     return {
         "metrics_df": metrics_df,
         "trades_df": trades_df,
-        "performance_fig": plot_performance_vs_benchmark(result, f'Walk-Forward Performance for {ticker} ({strategy_type})'),
-        "trades_fig": plot_trades_on_chart(result, ticker, f'Trades for {ticker} ({strategy_type})'),
+        "performance_fig": plot_performance_vs_benchmark(result, ticker=ticker, title=f'Walk-Forward Performance for {ticker} ({strategy_type})', timeframe=timeframe),
+        "trades_fig": plot_trades_on_chart(result, ticker=ticker, title=f'Trades for {ticker} ({strategy_type})', timeframe=timeframe),
         "importance_fig": importance_fig,
         "best_model_params": best_model_params,
         "best_strategy_params": best_strategy_params
     }
 
-def _load_strategy_params(ticker: str, strategy_type: str) -> Optional[dict]:
+def find_model_version_dirs(ticker: str, strategy_type: str, timeframe: str = '1d', rebalalce_freq: str = None) -> Optional[list[str]]:
+    """
+    Helper function to find the path to the versioned model directories
+    for a given ticker and strategy type.
+    
+    Returns the paths as a strings, or None if no versioned model is found.
+    """
+    try:
+        if not os.path.exists(MODEL_DIR):
+             logger.warning(f"Artifacts directory not found: {MODEL_DIR}")
+             return None
+
+        # List all directories that start with the ticker_strategy_type prefix
+        prefix_new = f'{ticker}_{strategy_type}_{timeframe}_'
+        if rebalalce_freq:
+            prefix_new += f'{rebalalce_freq}_'
+        
+        candidates = []
+        for d in os.listdir(MODEL_DIR):
+            if d.startswith(prefix_new):
+                candidates.append(d)
+            elif timeframe == '1d':
+                # Legacy format check: ticker_strategy_version (implicitly 1d)
+                # We need to ensure we don't pick up ticker_strategy_1h_version
+                prefix_legacy = f'{ticker}_{strategy_type}_'
+                if rebalalce_freq:
+                    prefix_legacy += f'{rebalalce_freq}_'
+                if d.startswith(prefix_legacy):
+                    remainder = d[len(prefix_legacy):]
+                    # Legacy versions start with year (e.g. 2023...), so '2'.
+                    # New timeframes start with '1' (1d, 1h, 15m) or '3' (30m).
+                    # If remainder starts with '2', it is safe to assume it's a legacy timestamp.
+                    if remainder and remainder[0] == '2': 
+                         candidates.append(d)
+
+        if not candidates:
+            logger.warning(f"No versioned model found for {ticker}_{strategy_type}_{timeframe} in {MODEL_DIR}.")
+            return None
+            
+        return sorted(candidates, reverse=True)
+    except FileNotFoundError:
+        logger.warning(f"Artifacts directory not found: {MODEL_DIR}")
+        return None
+
+def find_latest_model_version_dir(ticker: str, strategy_type: str, timeframe: str = '1d') -> Optional[str]:
+    """
+    Helper function to find the path to the latest versioned model directory
+    for a given ticker and strategy type.
+    
+    Returns the path as a string, or None if no versioned model is found.
+    """
+    versioned_model_dirs = find_model_version_dirs(ticker, strategy_type, timeframe)
+    if versioned_model_dirs:
+        latest_model_dir = os.path.join(MODEL_DIR, versioned_model_dirs[0])
+        logger.info(f"Found latest model version: {latest_model_dir}")
+        return latest_model_dir
+    else:
+        return None
+
+def get_model_path(ticker: str, strategy_type: str, timeframe: str, model_version: str) -> str:
+    """Constructs the path to a model directory, handling both new and legacy naming conventions."""
+    # Try new format first
+    new_name = f'{ticker}_{strategy_type}_{timeframe}_{model_version}'
+    new_path = os.path.join(MODEL_DIR, new_name)
+    
+    if os.path.exists(new_path):
+        return new_path
+        
+    # Try legacy format if timeframe is 1d
+    if timeframe == '1d':
+        legacy_name = f'{ticker}_{strategy_type}_{model_version}'
+        legacy_path = os.path.join(MODEL_DIR, legacy_name)
+        if os.path.exists(legacy_path):
+            return legacy_path
+            
+    # Default to new path if neither exists (caller will handle FileNotFoundError)
+    return new_path
+
+def get_available_backtest_runs():
+    """Searches the MODEL_DIR for all unique ticker/strategy combinations"""
+    from pathlib import Path
+    import re
+    dir_path = Path(MODEL_DIR)
+    # Regex pattern matching: ticker_strategy_timeframe_YYYYMMDD_HHMMSS
+    pattern = re.compile(
+        r"^([^_]+)_(.+)_([^_]+)_\d{8}_\d{6}$"
+    )
+
+    unique_configs = set()
+    for item in dir_path.iterdir():
+        if item.is_dir():
+            match = pattern.match(item.name)
+            if match:
+                ticker, strategy, timeframe = match.groups()
+                unique_configs.add(f"{ticker} - {strategy} - {timeframe}")
+    return sorted(list(unique_configs))
+
+def load_strategy_params(ticker: str, strategy_type: str, timeframe: str, model_version: Optional[str] = None) -> Optional[dict]:
     """
     Loads strategy parameters for a given ticker and strategy, prioritizing
     tuned parameters over last-run parameters, and falling back to defaults.
@@ -609,9 +676,17 @@ def _load_strategy_params(ticker: str, strategy_type: str) -> Optional[dict]:
     # Start with defaults
     params = get_strategy_defaults(strategy_class)
 
-    model_dir = os.path.join('pybroker_trainer', 'artifacts')
-    best_params_path = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_strategy_params.json')
-    last_run_params_path = os.path.join(model_dir, f'{ticker}_{strategy_type}_strategy_params.json')
+    if model_version:
+        model_path = get_model_path(ticker, strategy_type, timeframe, model_version)
+    else:
+        model_path = find_latest_model_version_dir(ticker, strategy_type, timeframe)
+
+    if not model_path or not os.path.isdir(model_path):
+        logger.error(f"Model directory not found for {ticker}_{strategy_type}_{timeframe} (Version: {model_version or 'latest'}). Please run 'train' command first.")
+        return None
+    
+    best_params_path = os.path.join(model_path, 'best_strategy_params.json')
+    last_run_params_path = os.path.join(model_path, 'strategy_params.json')
 
     # Prioritize best tuned params
     if os.path.exists(best_params_path):
@@ -731,7 +806,7 @@ class ExpandingWindowStrategy(pybroker.Strategy):
 
 BASE_CONTEXT_COLUMNS = ['open', 'high', 'low', 'close', 'volume', 'target', 'setup_mask', 'atr']
 
-def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01', end_date: Optional[str] = None, strategy_type: str = 'trend_following', tune_hyperparameters: bool = True, plot_results: bool = True, save_assets: bool = False, override_params: dict = None, use_tuned_strategy_params: bool = False, disable_inner_parallelism: bool = False, preloaded_data_df: pd.DataFrame = None, preloaded_features: list = None, commission_cost: float = 0.0, calc_bootstrap: bool = True, perform_noise_test: bool = False, stop_event_checker=None):
+def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01', end_date: Optional[str] = None, strategy_type: str = 'trend_following', tune_hyperparameters: bool = True, plot_results: bool = True, save_assets: bool = False, override_params: dict = None, use_tuned_strategy_params: bool = False, disable_inner_parallelism: bool = False, preloaded_data_df: pd.DataFrame = None, preloaded_features: list = None, commission_cost: float = 0.0, calc_bootstrap: bool = True, perform_noise_test: bool = False, stop_event_checker=None, model_n_calls: int = 32, timeframe_override: str = None, model_version: Optional[str] = None):
     """
     Runs the full walk-forward analysis for a given ticker.
     """
@@ -742,12 +817,13 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
     is_ml = True # Assume ML strategy by default
     all_quality_scores = [] # For tracking model quality across folds
     noise_test_results = [] # For tracking noise test results across folds
+    extra_data = {}
 
     try:
         if stop_event_checker and stop_event_checker():
             logger.warning("Stop event detected before starting walkforward analysis.")
             # Return the expected tuple format
-            return None, [], []
+            return None, [], extra_data
 
         # --- Unify default end_date handling ---
         if end_date is None:
@@ -755,16 +831,26 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
 
         # --- Load strategy config from JSON file ---
         strategy_class = load_strategy_class(strategy_type)
-        base_params = get_strategy_defaults(strategy_class) if strategy_class else {}
-        base_params.update({ # Add runtime params
-            'disable_inner_parallelism': disable_inner_parallelism,
-        })
+        if not strategy_class:
+            logger.error(f"Could not load strategy class for {strategy_type}. Aborting.")
+            return None, all_quality_scores, extra_data
 
-        # Load tuned strategy parameters if requested 
-        if use_tuned_strategy_params:
-            strategy_params = load_strategy_config(strategy_type, base_params)
-        else:
-            strategy_params = base_params
+        # --- Determine the correct timeframe ---
+        # Priority: 1. CLI override, 2. Strategy default
+        timeframe = timeframe_override if timeframe_override else '1d'
+        logger.info(f"Using timeframe: {timeframe}")
+
+        # --- Unified Parameter Loading ---
+        # Determine the correct strategy parameters to use for this run.
+        # Priority: 1. override_params, 2. use_tuned_strategy_params, 3. defaults.
+        strategy_params = get_strategy_defaults(strategy_class)
+        strategy_params.update({'disable_inner_parallelism': disable_inner_parallelism})
+
+        # --- Load strategy params from a specific version if provided ---
+        if use_tuned_strategy_params: # This flag now means "use saved params"
+            tuned_params = load_strategy_params(ticker, strategy_type, timeframe, model_version)
+            if tuned_params:
+                strategy_params.update(tuned_params)
 
         # Allow overriding parameters for optimization 
         if override_params:
@@ -782,7 +868,7 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
             features = preloaded_features
         else:
             if strategy_class:
-                base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params)
+                base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params, timeframe)
                 data_df = strategy_instance.prepare_data(data=base_df)
                 features = strategy_instance.get_feature_list()
                 context_columns_to_register = BASE_CONTEXT_COLUMNS + strategy_instance.get_extra_context_columns_to_register()
@@ -896,7 +982,8 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
                     features=features,
                     model_config=model_config,
                     stop_event_checker=stop_event_checker,
-                    symbol=symbol
+                    symbol=symbol,
+                    n_calls=model_n_calls
                 )
                 
                 final_model = LGBMClassifier(random_state=42, n_jobs=-1, class_weight='balanced', **model_config, **best_params)
@@ -1053,6 +1140,11 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
             warmup=2,
         )
 
+        extra_data['strategy_params'] = strategy_params
+        extra_data['features'] = features
+        extra_data['all_feature_importances'] = all_feature_importances
+        extra_data['noise_test_results'] = noise_test_results
+
         # --- Annualize Sharpe and Sortino Ratios ---
         if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
             # The result object is immutable. We create a new object with the annualized metrics_df.
@@ -1064,12 +1156,12 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
         if stop_event_checker and stop_event_checker():
             logger.warning("Stop event detected during pybroker walkforward. Results may be incomplete.")
             # Return whatever result we have, but don't save assets.
-            return savable_result, all_quality_scores, noise_test_results
+            return savable_result, all_quality_scores, extra_data
 
         if save_assets:
             if stop_event_checker and stop_event_checker():
                 logger.warning("Stop event detected before saving assets. Aborting save.")
-                return result, all_quality_scores, noise_test_results
+                return result, all_quality_scores, extra_data
 
             _save_walkforward_artifacts(
                 ticker=ticker,
@@ -1081,20 +1173,14 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
                 all_feature_importances=all_feature_importances,
                 tune_hyperparameters=tune_hyperparameters,
                 last_best_params=last_best_params,
-                strategy_params=strategy_params
+                strategy_params=strategy_params,
+                timeframe=timeframe,
+                model_version=model_version,
             )
 
         logger.info(f"\n--- Walk-Forward Analysis Results for {ticker} with {strategy_type} strategy ---")
         logger.info("NOTE: These metrics are calculated on out-of-sample test windows only, providing a more realistic performance estimate.")
         logger.info(display_metrics_df.to_string() if 'display_metrics_df' in locals() else result.metrics_df.to_string())
-        if plot_results:
-            fig_equity = plot_performance_vs_benchmark(result, f'Walk-Forward Equity Curve for {ticker}')
-            if fig_equity: 
-                plt.show()
-            if all_feature_importances:
-                fig_importance = plot_feature_importance(features, all_feature_importances)
-                if fig_importance:
-                    plt.show()
 
     except Exception as e:
         logger.error(f"An error occurred during the PyBroker walk-forward analysis for {ticker}: {e}")
@@ -1106,58 +1192,105 @@ def run_pybroker_walkforward(ticker: str = 'SPY', start_date: str = '2000-01-01'
             pybroker.unregister_columns(features)
         if context_columns_to_register:
             pybroker.unregister_columns(context_columns_to_register)
-    return result, all_quality_scores, noise_test_results # Return the result object and quality scores
+    return result, all_quality_scores, extra_data # Return the result object and quality scores
 
-def _save_walkforward_artifacts(ticker, strategy_type, result, is_ml, last_trained_model, features, all_feature_importances, tune_hyperparameters, last_best_params, strategy_params):
-    """Helper function to save all assets from a walk-forward run."""
+def _save_walkforward_artifacts(ticker, strategy_type, result, is_ml, last_trained_model, features, all_feature_importances, tune_hyperparameters, last_best_params, strategy_params, timeframe, model_version: Optional[str] = None): 
+    """Helper function to save all assets from a walk-forward run, including model versioning and PSI/CSI."""
     logger.info(f"--- Saving artifacts for {ticker} - {strategy_type} ---")
-    model_dir = os.path.join('pybroker_trainer', 'artifacts')
-    os.makedirs(model_dir, exist_ok=True)
 
-    # --- Always save core backtest artifacts ---
+    versioned_model_dir = None
+    if model_version:
+        logger.info(f"Attempting to save model parameters for specified version: {model_version}")
+        # The version string from the UI is just the timestamp part.
+        # Note: When saving, we prefer the NEW format even if the input version was legacy.
+        # This effectively migrates the run to the new structure if we are saving new artifacts.
+        versioned_model_dir = get_model_path(ticker, strategy_type, timeframe, model_version)
+    else:
+        logger.info("Attempting to save model parameters for the latest version...")
+        versioned_model_dir = find_latest_model_version_dir(ticker, strategy_type, timeframe)
+
+    if not versioned_model_dir or not os.path.exists(versioned_model_dir):
+        logger.warning(f"Provided model version directory does not exist: {versioned_model_dir}. Creating it.")
+        version_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        versioned_model_dir = os.path.join(MODEL_DIR, f'{ticker}_{strategy_type}_{timeframe}_{version_str}')
+        os.makedirs(versioned_model_dir, exist_ok=True)
+        
+    dir_name = os.path.basename(versioned_model_dir)
+    prefix = f'{ticker}_{strategy_type}_{timeframe}_'
+    if dir_name.startswith(prefix):
+        version_str = dir_name[len(prefix):]
+    else:
+        version_str = dir_name.split('_')[-1]
+ 
     # 1. Save the full backtest result object
-    results_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_results.pkl')
+    results_filename = os.path.join(versioned_model_dir, 'results.pkl')
     with open(results_filename, 'wb') as f:
         pickle.dump(result, f)
     logger.info(f"Saved backtest results to {results_filename}")
 
-    # 2. Save the strategy parameters used for the run
-    strategy_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_strategy_params.json')
+    # 2. Save the strategy parameters used for the run.
+    # This file documents the exact parameters that produced the accompanying 'results.pkl' and model files.
+    strategy_params['timeframe'] = timeframe
+    strategy_params_filename = os.path.join(versioned_model_dir, 'strategy_params.json')
     with open(strategy_params_filename, 'w') as f:
-        # --- Add a versioning flag to indicate ratios are annualized ---
-        params_to_save = strategy_params.copy()
-        params_to_save['ratios_annualized'] = True
-        json.dump(params_to_save, f, indent=4, cls=NumpyEncoder)
-    logger.info(f"Saved strategy parameters to {strategy_params_filename}")
+        json.dump(strategy_params, f, indent=4, cls=NumpyEncoder)
+    logger.info(f"Saved strategy parameters for this run to {strategy_params_filename}")
+
+    # --- Prepare metadata for versioned model ---
+    model_metadata = {
+        "ticker": ticker,
+        "strategy_type": strategy_type,
+        "timeframe": timeframe,
+        "version": version_str,
+        "training_date_utc": datetime.utcnow().isoformat(),
+        "strategy_params": strategy_params,
+        "model_params": None,
+        "psi_metrics": {},
+        "csi_metrics": {},
+        "prediction_metrics": {}, # For confidence/uncertainty
+        "last_fold_train_dates": {}, # For stability monitoring
+        "last_fold_test_dates": {}, # For stability monitoring
+    }
+    psi_model_score = None
 
     # --- Save ML-specific artifacts only if applicable ---
     if is_ml and last_trained_model:
         # 1. Save the model object
-        model_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}.pkl')
+        model_filename = os.path.join(versioned_model_dir, 'model.pkl')
         with open(model_filename, 'wb') as f:
-            pickle.dump(last_trained_model, f)
-        logger.info(f"Saved final trained model to {model_filename}")
+            try:
+                pickle.dump(last_trained_model, f)
+                logger.info(f"Saved final trained model to {model_filename}")
+            except (AttributeError, TypeError, pickle.PicklingError) as e:
+                raise e
 
         # 2. Save the features list
-        features_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_features.json')
+        features_filename = os.path.join(versioned_model_dir, 'features.json')
         with open(features_filename, 'w') as f:
             json.dump(features, f, indent=4)
         logger.info(f"Saved feature list to {features_filename}")
 
         # 3. Save feature importances
-        importances_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_importances.pkl')
+        importances_filename = os.path.join(versioned_model_dir, 'importances.pkl')
         with open(importances_filename, 'wb') as f:
             pickle.dump(all_feature_importances, f)
         logger.info(f"Saved feature importances to {importances_filename}")
 
         # 4. Save the best model hyperparameters if tuning was enabled
         if tune_hyperparameters and last_best_params:
-            params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_params.json')
+            model_metadata['model_params'] = convert_to_json_serializable(last_best_params)
+            params_filename = os.path.join(versioned_model_dir, 'model_hyperparameters.json')
             with open(params_filename, 'w') as f:
                 json.dump(convert_to_json_serializable(last_best_params), f, indent=4)
             logger.info(f"Saved best hyperparameters from last fold to {params_filename}")
 
-def _tune_hyperparameters_with_gp_minimize(train_data, features, model_config, stop_event_checker, symbol):
+    # --- Save model metadata ---
+    metadata_filename = os.path.join(versioned_model_dir, 'metadata.json')
+    with open(metadata_filename, 'w') as f:
+        json.dump(model_metadata, f, indent=4, cls=NumpyEncoder)
+    logger.info(f"Saved model metadata to {metadata_filename}")
+
+def _tune_hyperparameters_with_gp_minimize(train_data, features, model_config, stop_event_checker, symbol, n_calls=32):
     """
     Performs hyperparameter tuning for the LGBMClassifier using gp_minimize.
     This offers fine-grained control and supports an interruptible callback.
@@ -1205,7 +1338,7 @@ def _tune_hyperparameters_with_gp_minimize(train_data, features, model_config, s
     opt_result = gp_minimize(
         func=hp_objective,
         dimensions=dimensions,
-        n_calls=32,
+        n_calls=n_calls,
         random_state=42,
         callback=skopt_callback
     )
@@ -1214,33 +1347,64 @@ def _tune_hyperparameters_with_gp_minimize(train_data, features, model_config, s
     logger.info(f"[{symbol}] Best hyperparameters found: {best_params}")
     return best_params
 
-def infer(ticker: str, strategy_type: str, data_df: pd.DataFrame = None, strategy_params: dict = None):
+
+class MockExecContext:
+    """
+    A mock of pybroker's ExecContext that provides a rolling window view of data.
+    This is essential for accurately simulating the trader's exit logic.
+    """
+    def __init__(self, full_data: pd.DataFrame, current_loc: int, symbol: str, predictions: Optional[np.ndarray] = None, portfolio=None):
+        self._full_data = full_data
+        self._current_loc = current_loc
+        self._predictions = predictions
+        # For the lightweight simulation, this doesn't need to be a full Portfolio object.
+        # The simulation path only calls `get_exit_logic`, which doesn't use the portfolio.
+        # However, having the attribute prevents AttributeError if other paths are taken.
+        self._portfolio = portfolio
+        # Add core attributes that the trader might expect
+        self.symbol = symbol
+        self.session = {}  # Add a session dict for state
+        self.model_name = 'binary_classifier' # A default name the trader can use
+
+    def __getattr__(self, name):
+        # This is the key: when ctx.atr is accessed, it returns the series
+        # only up to the current bar, mimicking pybroker's behavior.
+        if name in self._full_data.columns:
+            return self._full_data[name].iloc[:self._current_loc + 1].values
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    
+    def preds(self, model_name: str) -> Optional[np.ndarray]:
+        """Mocks the preds method to return pre-calculated predictions."""
+        if self._predictions is None:
+            return None
+        # Return predictions up to the current bar
+        return self._predictions[:self._current_loc + 1]
+
+def infer(ticker: str, strategy_type: str, data_df: pd.DataFrame = None, strategy_params: dict = None, timeframe_override: str = None):
     """
     Loads a trained model and its artifacts to make a prediction on the latest data.
     Can accept a pre-prepared DataFrame to avoid redundant data loading.
     """
-    # logger.info(f"--- Running Inference for {ticker} with {strategy_type} strategy ---")
-    model_dir = os.path.join('pybroker_trainer', 'artifacts')
-    # --- Construct file paths ---
-    model_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}.pkl')
-    features_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_features.json')
-    params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_params.json') # Model HPs
+    # --- Determine the correct timeframe ---
+    timeframe = timeframe_override if timeframe_override else '1d'
+    logger.info(f"Using timeframe: {timeframe}")
 
+    # logger.info(f"--- Running Inference for {ticker} with {strategy_type} strategy ---")
     # --- Load artifacts if strategy_params were not passed in ---
     if strategy_params is None:
-        strategy_params = _load_strategy_params(ticker, strategy_type)
+        strategy_params = load_strategy_params(ticker, strategy_type, timeframe)
         if not strategy_params:
             return # Error logged in helper
 
-        # Hyperparameters are part of the model, but we can load them for reference
-        if os.path.exists(params_filename):
-            with open(params_filename, 'r') as f:
-                params = json.load(f)
-            logger.info(f"Confirming model was trained with hyperparameters: {params}")
-    
+    model_dir = find_latest_model_version_dir(ticker, strategy_type, timeframe)
+    # --- Construct file paths ---
+    model_filename = os.path.join(model_dir, 'model.pkl')
+    features_filename = os.path.join(model_dir, 'features.json')
+
     strategy_class = load_strategy_class(strategy_type)
     if not strategy_class:
         logger.error(f"Cannot perform inference: Strategy class for '{strategy_type}' not found.")
+        # The line `return` was here, which is not valid outside a function. Assuming it should be `return None`.
         return None
     strategy_instance = strategy_class(params=strategy_params)
     is_ml = strategy_instance.is_ml_strategy
@@ -1258,20 +1422,18 @@ def infer(ticker: str, strategy_type: str, data_df: pd.DataFrame = None, strateg
 
     except FileNotFoundError as e:
         if is_ml:
-            # This is not an error if we intend to fall back to a rule-based check.
-            # The 'model' variable will remain None, triggering the rule-based logic below.
-            logger.warning(f"ML model artifacts not found for {ticker} - {strategy_type}. Will use rule-based check instead.")
+            logger.warning(f"ML model artifacts not found for {ticker} - {strategy_type}. Using rule-based setup check instead.")
         else:
             logger.warning(f"This is a non-ML strategy. Proceeding with rule-based setup check.")
             model = None # Explicitly set model to None for non-ML strategies
             features = []
 
     # --- Prepare latest data if not provided ---
+    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
+    end_date = datetime.now().strftime('%Y-%m-%d')
     if data_df is None:
-        start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
-        end_date = datetime.now().strftime('%Y-%m-%d')
         try:
-            base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params)
+            base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params, timeframe=timeframe)
             data_df = strategy_instance.prepare_data(data=base_df)
             if data_df.empty:
                 logger.error("No data available for inference after preparation.")
@@ -1280,42 +1442,88 @@ def infer(ticker: str, strategy_type: str, data_df: pd.DataFrame = None, strateg
             logger.error(f"Error preparing data for inference: {e}")
             return None
 
+    # --- Initialize the result dictionary ---
+    inference_result = {
+        "decision": "HOLD",
+        "prediction": 0,
+        "probabilities": [1.0, 0.0],
+        "risk_per_trade_pct": None,
+        "stop_loss_price": None,
+        "take_profit_price": None,
+        "reward_risk_ratio": None,
+        "volatility_analysis": None,
+        "suggested_execution": "Buy Stock",
+    }
+
     # --- Perform Inference ---
     if is_ml and model is not None: 
         # --- Inference for ML-based strategies ---
         if not all(f in data_df.columns for f in features):
             raise ValueError(f"Missing features for inference: {set(features) - set(data_df.columns)}")
-        last_data_point = data_df[features].iloc[-1:]
-        prediction = model.predict(last_data_point)
-        prediction_proba = model.predict_proba(last_data_point)
+        
+        # --- REVISED: Use custom_predict_fn to handle model bundles ---
+        if isinstance(model, dict):
+            model_bundle = model
+        else:
+            model_bundle = {'model': model, 'features': features, 'is_regime_model': False}
+
+        # Predict on the entire dataframe to provide context for the trader logic
+        all_predictions = custom_predict_fn(model_bundle, data_df)
+        last_prediction = all_predictions[-1]
+        predicted_class = np.argmax(last_prediction)
         
         logger.info(f"--- ML Inference Result for {ticker} on {data_df['date'].iloc[-1].date()} ---")
-        logger.info(f"Strategy: {strategy_type}, Predicted Class: {prediction[0]}, Prediction Probabilities: {prediction_proba[0]}")
+        logger.info(f"Strategy: {strategy_type}, Predicted Class: {predicted_class}, Prediction Probabilities: {last_prediction}")
         
-        if len(prediction_proba[0]) > 2: # Multiclass
-            final_decision = "HOLD"
-            if prediction[0] == 1: final_decision = "BUY"
-            elif prediction[0] == 2: final_decision = "SELL"
-        else: # Binary
-            final_decision = "BUY" if prediction[0] == 1 else "HOLD"
+        inference_result["prediction"] = int(predicted_class)
+        inference_result["probabilities"] = last_prediction.tolist()
 
-        logger.info(f"Final Decision: {final_decision}")
-        return {
-            "decision": final_decision,
-            "prediction": int(prediction[0]),
-            "probabilities": prediction_proba[0].tolist()
-        }
+        if len(last_prediction) > 2: # Multiclass
+            final_decision = "HOLD"
+            if predicted_class == 1: final_decision = "BUY"
+            elif predicted_class == 2: final_decision = "SELL"
+        else: # Binary
+            final_decision = "BUY" if predicted_class == 1 else "HOLD"
+        
+        inference_result["decision"] = final_decision
     else:
         # --- Inference for rule-based strategies ---
         setup_mask = strategy_instance.get_setup_mask(data_df)
-
         is_setup = False if setup_mask.empty else setup_mask.iloc[-1]
         decision = "BUY" if is_setup else "HOLD"
-        probabilities = [0.0, 1.0] if is_setup else [1.0, 0.0]
-        
+        inference_result["decision"] = decision
+        inference_result["probabilities"] = [0.0, 1.0] if is_setup else [1.0, 0.0]
+        all_predictions = None # No predictions for rule-based strategies
+
         logger.info(f"--- Rule-Based Inference Result for {ticker} on {data_df['date'].iloc[-1].date()} ---")
         logger.info(f"Strategy: {strategy_type}, Setup Condition Met: {is_setup}, Final Decision: {decision}")
-        return {"decision": decision, "probabilities": probabilities}
+
+    # --- If BUY signal, calculate actionable trade parameters ---
+    if inference_result["decision"] == "BUY":
+        logger.info("BUY signal detected. Calculating trade parameters...")
+        trader = strategy_instance.get_trader(model_name=None, params_map={ticker: strategy_params}, data_source=data_df, start_date=start_date, end_date=end_date)
+        
+        # Create a mock context for the last bar
+        last_loc = len(data_df) - 1
+        mock_ctx = MockExecContext(data_df, last_loc, ticker, predictions=all_predictions)
+        
+        try:
+            risk_pct = trader.get_risk_per_trade(mock_ctx, strategy_params)
+            exit_logic = trader.get_exit_logic(mock_ctx, strategy_params)
+            
+            if exit_logic and 'stop_loss' in exit_logic and exit_logic['stop_loss'] > 0:
+                inference_result["risk_per_trade_pct"] = risk_pct
+                stop_loss_points = float(exit_logic['stop_loss'])
+                inference_result["stop_loss_price"] = mock_ctx.close[-1] - stop_loss_points
+                if 'take_profit' in exit_logic and exit_logic['take_profit'] > 0:
+                    take_profit_points = float(exit_logic['take_profit'])
+                    inference_result["take_profit_price"] = mock_ctx.close[-1] + take_profit_points
+                    inference_result["reward_risk_ratio"] = take_profit_points / stop_loss_points
+
+        except Exception as e:
+            logger.error(f"Could not calculate trade parameters for {ticker}: {e}", exc_info=True)
+
+    return inference_result
 
 
 @click.group()
@@ -1326,14 +1534,16 @@ def cli():
 @cli.command()
 @click.option('--ticker', '-t', required=True, help='Stock ticker symbol.')
 @click.option('--strategy-type', '-s', required=True, type=click.Choice(list(STRATEGY_CLASS_MAP.keys())), help='The type of strategy to train.')
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
 @click.option('--tune/--no-tune', default=True, help='Enable/disable hyperparameter tuning. Default is enabled.')
 @click.option('--plot/--no-plot', default=True, help='Plot results immediately after training. Default is disabled.')
-@click.option('--start-date', default='2000-01-01', help='Start date for backtest (YYYY-MM-DD).')
+@click.option('--start-date', default=FULL_HISTORY_START_DATE, help='Start date for backtest (YYYY-MM-DD).')
 @click.option('--end-date', default=None, help='End date for backtest (YYYY-MM-DD). Defaults to yesterday.')
 @click.option('--use-tuned-strategy-params/--no-use-tuned-strategy-params', default=True, help='Use best parameters found by tune-strategy.')
 @click.option('--override-param', '-o', 'override_params', multiple=True, help='Override a specific strategy parameter (e.g., -o risk_per_trade_pct=0.02).')
 @click.option('--commission', default=0.0, help='Commission cost per share (e.g., 0.005).')
-def train(ticker, strategy_type, tune, plot, start_date, end_date, use_tuned_strategy_params, override_params, commission):
+@click.option('--json-output/--no-json-output', default=False, help='Output final metrics as JSON for agent consumption.')
+def train(ticker, strategy_type, timeframe, tune, plot, start_date, end_date, use_tuned_strategy_params, override_params, commission, json_output):
     """Runs the walk-forward analysis and saves the final model."""
     override_dict = {}
     if override_params:
@@ -1350,28 +1560,41 @@ def train(ticker, strategy_type, tune, plot, start_date, end_date, use_tuned_str
                 value = value_str # Keep as string if conversion fails
             override_dict[key.strip()] = value
 
-    run_pybroker_walkforward(
+    result, quality_scores, extra_data = run_pybroker_walkforward(
         ticker=ticker.upper(), 
         strategy_type=strategy_type,
+        timeframe_override=timeframe,
         start_date=start_date, 
         end_date=end_date, 
         tune_hyperparameters=tune, 
-        plot_results=plot, save_assets=True, 
+        plot_results=plot and not json_output, # Disable plots if JSON output is requested
+        save_assets=True, 
         use_tuned_strategy_params=use_tuned_strategy_params,
         override_params=override_dict,
         commission_cost=commission
     )
 
+    if json_output:
+        output = {
+            "status": "success" if result else "failed",
+            "metrics": asdict(result.metrics) if result else {},
+            "quality_scores": quality_scores,
+            "noise_test": extra_data.get('noise_test_results')
+        }
+        # Print a distinct marker so the Agent can easily regex/parse the JSON out of the logs
+        print(f"__JSON_START__:{json.dumps(output, cls=NumpyEncoder)}:__JSON_END__")
+
 @cli.command(name='visualize-model')
 @click.option('--ticker', '-t', required=True, help='Stock ticker symbol.')
 @click.option('--strategy-type', '-s', required=True, type=click.Choice(list(STRATEGY_CLASS_MAP.keys())), help='The type of strategy to visualize.')
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
 @click.option('--plot/--no-plot', default=True, help='Plot results. Default is enabled.')
-def visualize_model(ticker, strategy_type, plot):
+def visualize_model(ticker, strategy_type, timeframe, plot):
     """
     Loads and visualizes the saved walk-forward backtest results for a trained model.
     This command shows the true out-of-sample performance.
     """
-    viz_assets = run_visualize_model(ticker.upper(), strategy_type)
+    viz_assets = run_visualize_model(ticker.upper(), strategy_type, timeframe)
 
     if not viz_assets:
         logger.error("Visualization failed to produce assets.")
@@ -1395,19 +1618,21 @@ def visualize_model(ticker, strategy_type, plot):
 @cli.command(name='tune-strategy')
 @click.option('--ticker', '-t', required=True, help='Stock ticker symbol.')
 @click.option('--strategy-type', '-s', required=True, type=click.Choice(list(STRATEGY_CLASS_MAP.keys())), help='The type of strategy to tune.')
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
 @click.option('--n-calls', default=100, help='Number of optimization iterations.')
-@click.option('--start-date', default='2000-01-01', help='Start date for tuning data (YYYY-MM-DD).')
+@click.option('--start-date', default=FULL_HISTORY_START_DATE, help='Start date for tuning data (YYYY-MM-DD).')
 @click.option('--end-date', default=None, help='End date for tuning data (YYYY-MM-DD).')
 @click.option('--commission', default=0.0, help='Commission cost per share (e.g., 0.005).')
 @click.option('--max-drawdown', default=40.0, help='Maximum acceptable drawdown percentage for tuning objective.')
 @click.option('--min-trades', default=20, help='Minimum acceptable trade count for tuning objective.')
 @click.option('--min-win-rate', default=40.0, help='Minimum acceptable win rate for tuning objective.')
-def tune_strategy(ticker, strategy_type, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate):
+@click.option('--json-output/--no-json-output', default=False, help='Output final metrics as JSON for agent consumption.')
+def tune_strategy(ticker, strategy_type, timeframe, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, json_output):
     """Performs Bayesian optimization on strategy-level parameters."""
     logger.info("running tune strategy...")
-    run_tune_strategy(ticker.upper(), strategy_type, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, progress_callback=None, stop_event_checker=None)
+    run_tune_strategy(ticker.upper(), strategy_type, timeframe, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, progress_callback=None, stop_event_checker=None, json_output=json_output)
 
-def run_tune_strategy(ticker, strategy_type, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, progress_callback=None, stop_event_checker=None):
+def run_tune_strategy(ticker, strategy_type, timeframe_override, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, progress_callback=None, stop_event_checker=None, json_output=False):
     """Core logic for Bayesian optimization on strategy-level parameters."""
     logger.info(f"--- Starting Strategy-Level Parameter Tuning for {ticker} with {strategy_type} ---")
 
@@ -1419,12 +1644,17 @@ def run_tune_strategy(ticker, strategy_type, n_calls, start_date, end_date, comm
     if not search_space:
         logger.error(f"Strategy tuning is not configured for strategy_type '{strategy_type}'.")
         return
+
     strategy_params = get_strategy_defaults(strategy_class)
+    timeframe = timeframe_override if timeframe_override else '1d'
+    strategy_instance = strategy_class(params=strategy_params)
+    is_ml_strategy = strategy_instance.is_ml_strategy # type: ignore
+    features = strategy_instance.get_feature_list()
 
     # --- Load raw price data ONCE before the tuning loop to avoid repeated I/O ---
     try:
         logger.info("Preparing base data for tuning process... (This may take a moment)")
-        base_data_df = _prepare_base_data(ticker, start_date, end_date, strategy_params)
+        base_data_df = _prepare_base_data(ticker, start_date, end_date, strategy_params, timeframe=timeframe)
         if base_data_df.empty:
             logger.error("Base data preparation failed for tuning. Aborting.")
             return
@@ -1488,7 +1718,7 @@ def run_tune_strategy(ticker, strategy_type, n_calls, start_date, end_date, comm
         pybroker.register_columns(context_columns_to_register) # Always register context columns
 
         result, quality_scores, _ = run_pybroker_walkforward(
-            ticker=ticker.upper(), strategy_type=strategy_type,
+            ticker=ticker.upper(), strategy_type=strategy_type, timeframe_override=timeframe, 
             start_date=start_date, end_date=end_date, tune_hyperparameters=False, plot_results=False, save_assets=False,
             override_params=current_strategy_params, disable_inner_parallelism=True, 
             commission_cost=commission,
@@ -1573,49 +1803,40 @@ def run_tune_strategy(ticker, strategy_type, n_calls, start_date, end_date, comm
                 logger.info(f"  {key}: {value}")
         logger.info("------------------------------------------------------------------------------------")
 
-    # --- Save the best parameters to a file ---
-    model_dir = os.path.join('pybroker_trainer', 'artifacts')
-    os.makedirs(model_dir, exist_ok=True)
-    tuned_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_strategy_params.json')
+    if json_output:
+        output = {
+            "status": "success",
+            "best_params": best_params_dict,
+            "best_score": -opt_result.fun
+        }
+        print(f"__JSON_START__:{json.dumps(output, cls=NumpyEncoder)}:__JSON_END__")
+
+    version_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    versioned_dir = os.path.join(MODEL_DIR, f'{ticker}_{strategy_type}_{timeframe}_{version_str}')
+    os.makedirs(versioned_dir, exist_ok=True)
+    tuned_params_filename = os.path.join(versioned_dir, 'best_strategy_params.json')
     with open(tuned_params_filename, 'w') as f:
-        # --- Add the versioning flag to the best params file ---
-        params_to_save = best_params_dict.copy()
-        params_to_save['ratios_annualized'] = True
-        json.dump(params_to_save, f, indent=4, cls=NumpyEncoder)
+        json.dump(best_params_dict, f, indent=4, cls=NumpyEncoder)
     logger.info(f"Saved best strategy parameters to {tuned_params_filename}")
 
-    # --- Re-run the final backtest with the best parameters to save the results ---
-    # This ensures that visualize-model will show the performance of the tuned strategy.
-    logger.info("\n--- Re-running final backtest with best parameters to save artifacts... ---")
-    # For ML strategies, we also tune the model's hyperparameters on this final run.
-    # For rule-based strategies, the `tune_hyperparameters` flag has no effect.
-    run_pybroker_walkforward(
-        ticker=ticker,
-        strategy_type=strategy_type,
-        start_date=start_date,
-        end_date=end_date,
-        tune_hyperparameters=True,
-        plot_results=False,
-        save_assets=True,
-        override_params=best_params_dict,
-        commission_cost=commission,
-        use_tuned_strategy_params=False # We are overriding directly
-    )
-    logger.info(f"--- Artifacts for best parameters saved. You can now use 'visualize-model'. ---")
+    # Return the best parameters found. The caller will be responsible for running the final training.
+    # --- REVISED: Return the version string as well ---
+    return best_params_dict, version_str
 
 @cli.command(name='predict')
 @click.option('--ticker', '-t', required=True, help='Stock ticker symbol.')
 @click.option('--strategy-type', '-s', required=True, type=click.Choice(list(STRATEGY_CLASS_MAP.keys())), help='The strategy to use for prediction.')
-def predict(ticker, strategy_type):
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
+def predict(ticker, strategy_type, timeframe):
     """
     Runs inference on the latest data using one or more saved models.
     If multiple strategies are provided, it runs a portfolio inference.
     """
-    result = infer(ticker=ticker.upper(), strategy_type=strategy_type)
+    result = infer(ticker=ticker.upper(), strategy_type=strategy_type, timeframe_override=timeframe)
     if result:
         print(f"Inference Result: {json.dumps(result, indent=2)}")
 
-def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = '2000-01-01', end_date: str = '2024-12-31', strategy_type: str = 'trend_following', commission_cost: float = 0.0) -> Optional[dict]:
+def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = FULL_HISTORY_START_DATE, end_date: str = '2024-12-31', strategy_type: str = 'trend_following', commission_cost: float = 0.0, timeframe_override: str = None, preloaded_strategy_params: dict = None, model_version: Optional[str] = None) -> Optional[dict]:
     """
     Runs a full, in-sample backtest using a pre-trained model saved by the 'train' command.
     This function loads the saved model and its associated parameters, then runs a backtest
@@ -1635,26 +1856,41 @@ def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = '2000-01-0
             logger.error(f"Could not load strategy class for {strategy_type}. Aborting.")
             return None
         
-        # Load the best available strategy parameters. This prioritizes tuned params.
-        strategy_params = _load_strategy_params(ticker, strategy_type)
-        if not strategy_params:
-            logger.error(f"Could not load strategy parameters for {ticker} - {strategy_type}. Aborting backtest.")
-            return None
+        # --- Determine the correct timeframe ---
+        timeframe = timeframe_override if timeframe_override else '1d'
+        logger.info(f"Using timeframe: {timeframe}")
 
-        strategy_instance = strategy_class(params=strategy_params) # type: ignore
+        if preloaded_strategy_params:
+            strategy_params = preloaded_strategy_params
+        else:
+            # Load the best available strategy parameters. This prioritizes tuned params.
+            strategy_params = load_strategy_params(ticker, strategy_type, timeframe, model_version)
+            if not strategy_params:
+                logger.error(f"Could not load strategy parameters for {ticker} - {strategy_type}. Aborting backtest.")
+                return None
+
+        strategy_instance = strategy_class(params=strategy_params) 
         is_ml = strategy_instance.is_ml_strategy
         
         # --- Step 2: If it's an ML strategy, load all saved model artifacts ---
         if is_ml:
             try:
-                model_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}.pkl')
-                with open(model_filename, 'rb') as f: model = pickle.load(f)
+                if model_version:
+                    logger.info(f"Starting backtest with specified model version: {model_version}")
+                    model_path = get_model_path(ticker, strategy_type, timeframe, model_version)
+                else:
+                    logger.info("Starting backtest with latest saved model...")
+                    model_path = find_latest_model_version_dir(ticker, strategy_type, timeframe)
 
-                features_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_features.json')
-                with open(features_filename, 'r') as f: features = json.load(f)
+                if not model_path or not os.path.isdir(model_path):
+                    logger.error(f"Model directory not found for {ticker}_{strategy_type}_{timeframe} (Version: {model_version or 'latest'}). Please run 'train' command first.")
+                    return None
                 
-                logger.info(f"Loaded model and artifacts for {ticker} {strategy_type}")
-
+                model_filename = os.path.join(model_path, 'model.pkl')
+                features_filename = os.path.join(model_path, 'features.json')
+                with open(model_filename, 'rb') as f: model = pickle.load(f)
+                with open(features_filename, 'r') as f: features = json.load(f)
+                logger.info(f"Loaded model and artifacts from {model_path}")
             except FileNotFoundError as e:
                 logger.error(f"Error loading model artifacts for ML strategy: {e}. Please run 'train' command first.")
                 return None
@@ -1663,7 +1899,7 @@ def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = '2000-01-0
             features = strategy_instance.get_feature_list() # Should be empty, but get it anyway
 
         # --- Step 3: Prepare data for the full backtest range ---
-        base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params)
+        base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params, timeframe=timeframe)
         data_df = strategy_instance.prepare_data(data=base_df)
         context_columns_to_register = BASE_CONTEXT_COLUMNS + strategy_instance.get_extra_context_columns_to_register()
         
@@ -1740,23 +1976,24 @@ def run_pybroker_full_backtest(ticker: str = 'SPY', start_date: str = '2000-01-0
         if context_columns_to_register:
             pybroker.unregister_columns(context_columns_to_register)
 
-def run_quick_test(ticker: str, strategy_type: str, start_date: str, end_date: str, strategy_params: dict, commission_cost: float, stop_event_checker=None) -> Optional[dict]:
+def run_quick_test(ticker: str, strategy_type: str, start_date: str, end_date: str, strategy_params: dict, commission_cost: float, timeframe_override: str, stop_event_checker=None) -> Optional[dict]:
     """
     Runs a quick backtest using run_pybroker_walkforward with default hyperparameters.
     This ensures that ML strategies use a real model (LGBM) so that probability thresholds are respected.
     """
     try:
         if stop_event_checker and stop_event_checker(): return None
+        timeframe = timeframe_override if timeframe_override else '1d'
 
         # Use run_pybroker_walkforward to handle the backtest logic
         # We disable tuning to make it "quick", but it will still train a default model.
-        result, _, noise_results = run_pybroker_walkforward(
+        result, _, extra_data = run_pybroker_walkforward(
             ticker=ticker,
             strategy_type=strategy_type,
+            timeframe_override=timeframe,
             start_date=start_date,
             end_date=end_date,
             tune_hyperparameters=False, # Quick test doesn't tune
-            plot_results=False,
             save_assets=False,
             override_params=strategy_params,
             use_tuned_strategy_params=False, # Use the passed params (which might be defaults + overrides)
@@ -1771,7 +2008,7 @@ def run_quick_test(ticker: str, strategy_type: str, start_date: str, end_date: s
 
         # --- Annualize Sharpe and Sortino Ratios ---
         if hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
-            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
+            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, timeframe)
         else:
             display_metrics_df = pd.DataFrame()
 
@@ -1780,9 +2017,9 @@ def run_quick_test(ticker: str, strategy_type: str, start_date: str, end_date: s
         return {
             "metrics_df": display_metrics_df,
             "trades_df": trades_df,
-            "performance_fig": plot_performance_vs_benchmark(result, f'Quick Test Performance for {ticker} ({strategy_type})', ticker=ticker),
-            "trades_fig": plot_trades_on_chart(result, ticker, f'Quick Test Trades for {ticker} ({strategy_type})'),
-            "noise_test_results": noise_results
+            "performance_fig": plot_performance_vs_benchmark(result, title=f'Quick Test Performance for {ticker} ({strategy_type})', ticker=ticker, timeframe=timeframe),
+            "trades_fig": plot_trades_on_chart(result, ticker, title=f'Quick Test Trades for {ticker} ({strategy_type})', timeframe=timeframe),
+            "noise_test_results": extra_data.get('noise_test_results')
         }
 
     except Exception as e:
@@ -1790,7 +2027,7 @@ def run_quick_test(ticker: str, strategy_type: str, start_date: str, end_date: s
         traceback.print_exc()
         return None
 
-def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, start_date: str, end_date: str, plot_results: bool = True, use_tuned_strategy_params: bool = False, max_open_positions: int = 5, commission_cost: float = 0.0):
+def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, start_date: str, end_date: str, timeframe_override: str = None, plot_results: bool = True, use_tuned_strategy_params: bool = False, max_open_positions: int = 5, commission_cost: float = 0.0, model_version: Optional[str] = None):
     """
     Runs a single walk-forward backtest on a portfolio of tickers.
     This is used to validate scanning-based strategies like RSI Divergence.
@@ -1806,7 +2043,13 @@ def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, star
         if not strategy_class:
             logger.error(f"Could not load strategy class for {strategy_type}. Aborting.")
             return None
-        is_ml = strategy_class(params={}).is_ml_strategy
+
+        # --- Determine the correct timeframe ---
+        # For portfolios, we use one timeframe for all tickers.
+        default_params = get_strategy_defaults(strategy_class)
+        timeframe = timeframe_override if timeframe_override else '1d'
+        is_ml = strategy_class(params=default_params).is_ml_strategy
+        params_map: Dict[str, dict] = {}
 
         for ticker in tickers:
             try:
@@ -1814,19 +2057,25 @@ def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, star
                 current_strategy_params = get_strategy_defaults(strategy_class) if strategy_class else {}
 
                 if use_tuned_strategy_params:
-                    model_dir = os.path.join('pybroker_trainer', 'artifacts')
-                    tuned_params_filename = os.path.join(model_dir, f'{ticker}_{strategy_type}_best_strategy_params.json')
-                    if os.path.exists(tuned_params_filename):
-                        with open(tuned_params_filename, 'r') as f:
-                            tuned_params = json.load(f)
-                        logger.info(f"Loaded tuned strategy parameters for {ticker}.")
-                        current_strategy_params.update(tuned_params)
+                    model_path = None
+                    if model_version:
+                        model_path = get_model_path(ticker, strategy_type, timeframe, model_version)
                     else:
-                        logger.warning(f"Tuned params file not found for {ticker}. Using defaults.")
+                        model_path = find_latest_model_version_dir(ticker, strategy_type, timeframe)
+
+                    if model_path:
+                        tuned_params_filename = os.path.join(model_path, 'best_strategy_params.json')
+                        if os.path.exists(tuned_params_filename):
+                            with open(tuned_params_filename, 'r') as f:
+                                tuned_params = json.load(f)
+                            logger.info(f"Loaded tuned strategy parameters for {ticker} from version.")
+                            current_strategy_params.update(tuned_params)
+                        else:
+                            logger.warning(f"Tuned params file not found for {ticker} in version '{model_version or 'latest'}'. Using defaults.")
                 
                 params_map[ticker] = current_strategy_params
                 strategy_instance = strategy_class(params=current_strategy_params)
-                base_df = _prepare_base_data(ticker, start_date, end_date, current_strategy_params)
+                base_df = _prepare_base_data(ticker, start_date, end_date, current_strategy_params, timeframe=timeframe)
                 data_df = strategy_instance.prepare_data(data=base_df)
                 if not data_df.empty:
                     all_data_dfs.append(data_df)
@@ -1924,12 +2173,12 @@ def run_pybroker_portfolio_backtest(tickers: list[str], strategy_type: str, star
         # --- Annualize Sharpe and Sortino Ratios ---
         if result and hasattr(result, 'metrics') and hasattr(result, 'metrics_df'):
             # The result object is immutable. We create a separate, annualized version for display/logging.
-            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, '1d')
+            display_metrics_df = prepare_metrics_df_for_display(result.metrics_df, timeframe)
             
         logger.info(f"\n--- Portfolio Walk-Forward Results for {strategy_type} strategy ---")
         logger.info(display_metrics_df.to_string() if 'display_metrics_df' in locals() else result.metrics_df.to_string())
         if plot_results:
-            plot_performance_vs_benchmark(result, f"Portfolio Performance ({strategy_type})")
+            plot_performance_vs_benchmark(result, title=f"Portfolio Performance ({strategy_type})", ticker=ticker, timeframe=timeframe)
 
     except Exception as e:
         logger.error(f"An error occurred during the portfolio backtest: {e}")
@@ -1961,28 +2210,30 @@ def get_default_tickers(source: int = 2, market: str = 'us', min_volume: int = 5
 
 @cli.command(name='pre-scan-universe')
 @click.option('--tickers', '-t', help='Comma-separated list of candidate tickers to scan.')
+@click.option('--market', default='us', help='The market to scan for tickers (defaults to US) when tickers are not provided.')
 @click.option('--strategy-type', '-s', required=True, type=click.Choice(list(STRATEGY_CLASS_MAP.keys())), help='The strategy to check for setups.')
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
 @click.option('--min-setups', default=60, help='Minimum number of historical setups required for a ticker to be included.')
-@click.option('--start-date', default='2000-01-01', help='Start date for historical data.')
+@click.option('--start-date', default=FULL_HISTORY_START_DATE, help='Start date for historical data.')
 @click.option('--end-date', default=None, help='End date for historical data (defaults to yesterday).')
-def pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_date):
-    """Scans tickers for a minimum number of historical setups."""
-    valid_tickers, _ = run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_date, stop_event_checker=None)
+def pre_scan_universe(tickers, market, strategy_type, timeframe, min_setups, start_date, end_date):
+    """Scans tickers for a minimum number of historical setups.""" # timeframe is now timeframe_override
+    valid_tickers, _ = run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_date, market, timeframe_override=timeframe, stop_event_checker=None)
     if valid_tickers:
         logger.info("Use the following string for the --tickers option in other commands:")
         print(",".join(valid_tickers))
 
-def run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_date, progress_callback=None, stop_event_checker=None):
+def run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_date, market='us', timeframe_override=None, progress_callback=None, stop_event_checker=None):
     """Core logic to scan tickers for a minimum number of historical setups."""
     if tickers:
         ticker_list = [t.strip().upper() for t in tickers.split(',')]
     else:
-        ticker_list = get_default_tickers(limit=100)
+        ticker_list = get_default_tickers(limit=100, market=market)
     
     if not start_date:
-        start_date = '2000-01-01'
+        start_date = FULL_HISTORY_START_DATE
     if not end_date:
-        end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        end_date = datetime.now().strftime('%Y-%m-%d')
 
     logger.info(f"Scanning {len(ticker_list)} tickers for a minimum of {min_setups} '{strategy_type}' setups...")
 
@@ -1990,6 +2241,10 @@ def run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_da
     if not strategy_class:
         logger.error(f"Could not load strategy class for {strategy_type}. Aborting.")
         return None
+
+    # --- Determine the correct timeframe ---
+    default_params = get_strategy_defaults(strategy_class)
+    timeframe = timeframe_override if timeframe_override else '1d'
 
     ticker_setup_count = {}
     for i, ticker in enumerate(ticker_list):
@@ -2002,11 +2257,10 @@ def run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_da
 
         try:
             ticker_setup_count[ticker] = 0
-            strategy_params = get_strategy_defaults(strategy_class)
 
             # Instantiate the strategy to call its get_setup_mask method
-            strategy_instance = strategy_class(params=strategy_params)
-            base_df = _prepare_base_data(ticker, start_date, end_date, strategy_params)
+            strategy_instance = strategy_class(params=default_params)
+            base_df = _prepare_base_data(ticker, start_date, end_date, default_params, timeframe=timeframe)
             data_df = strategy_instance.prepare_data(data=base_df)
             if data_df.empty:
                 logger.warning(f"[{ticker}] No data available. Skipping.")
@@ -2035,33 +2289,36 @@ def run_pre_scan_universe(tickers, strategy_type, min_setups, start_date, end_da
 @cli.command(name='portfolio-backtest')
 @click.option('--strategy-type', '-s', required=True, type=click.Choice(list(STRATEGY_CLASS_MAP.keys())), help='The type of strategy to backtest on a portfolio.')
 @click.option('--tickers', '-t', required=True, help='Comma-separated list of tickers for the portfolio.')
+@click.option('--market', default='us', help='The market to scan for tickers (defaults to US) when tickers are not provided.')
 @click.option('--start-date', default='2000-01-01', help='Start date for backtest (YYYY-MM-DD).')
 @click.option('--end-date', default=None, help='End date for backtest (YYYY-MM-DD).')
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
 @click.option('--max-open-positions', default=5, help='Maximum number of concurrent long positions in the portfolio.')
 @click.option('--plot/--no-plot', default=True, help='Plot results. Default is enabled.')
 @click.option('--use-tuned-strategy-params/--no-use-tuned-strategy-params', default=False, help='Use best parameters found by tune-strategy for each stock.')
 @click.option('--commission', default=0.0, help='Commission cost per share (e.g., 0.005).')
-def portfolio_backtest(strategy_type, tickers, start_date, end_date, max_open_positions, plot, use_tuned_strategy_params, commission):
+def portfolio_backtest(strategy_type, tickers, market, start_date, end_date, timeframe, max_open_positions, plot, use_tuned_strategy_params, commission):
     """Runs a portfolio-level backtest to validate a scanning strategy."""
     if tickers:
         ticker_list = [t.strip().upper() for t in tickers.split(',')]
     else:
-        ticker_list = get_default_tickers()
+        ticker_list = get_default_tickers(market=market)
 
     if not start_date:
-        start_date = '2000-01-01'
+        start_date = FULL_HISTORY_START_DATE
     if not end_date:
         end_date = datetime.now().strftime('%Y-%m-%d')
 
-    run_pybroker_portfolio_backtest(ticker_list, strategy_type, start_date, end_date, plot, use_tuned_strategy_params, max_open_positions, commission)
+    run_pybroker_portfolio_backtest(ticker_list, strategy_type, start_date, end_date, timeframe, plot, use_tuned_strategy_params, max_open_positions, commission) # timeframe is timeframe_override
 
-def run_scan(ticker_list: list[str], strategy_list: list[str], progress_callback=None, stop_event_checker=None) -> list[dict]:
+def run_scan(ticker_list: list[str], strategy_list: list[str], timeframe_override: str = None, progress_callback=None, stop_event_checker=None) -> list[dict]:
     """
     Scans a list of tickers for stocks showing bullish setups.
     This is the core logic, callable from other scripts.
     """
     found_signals = []
     total_items = len(ticker_list)
+    timeframe = timeframe_override if timeframe_override else '1d'
 
     for i, ticker in enumerate(ticker_list):
         if stop_event_checker and stop_event_checker():
@@ -2075,7 +2332,7 @@ def run_scan(ticker_list: list[str], strategy_list: list[str], progress_callback
             # --- OPTIMIZATION: Prepare base data ONCE per ticker ---
             start_date_str = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
             end_date_str = datetime.now().strftime('%Y-%m-%d')
-            base_df = _prepare_base_data(ticker, start_date_str, end_date_str, {'include_earnings_dates': True})
+            base_df = _prepare_base_data(ticker, start_date_str, end_date_str, {'include_earnings_dates': True}, timeframe=timeframe)
             
             if base_df.empty:
                 logger.warning(f"Could not load base data for {ticker}. Skipping.")
@@ -2084,7 +2341,7 @@ def run_scan(ticker_list: list[str], strategy_list: list[str], progress_callback
             for strategy_type in strategy_list:
                 try:
                     # --- Load best available params for the specific strategy ---
-                    strat_params = _load_strategy_params(ticker, strategy_type)
+                    strat_params = load_strategy_params(ticker, strategy_type, timeframe)
                     if not strat_params:
                         continue # Error logged in helper
                 
@@ -2096,7 +2353,7 @@ def run_scan(ticker_list: list[str], strategy_list: list[str], progress_callback
                         logger.warning(f"[{ticker}] No data after preparation for {strategy_type}. Skipping.")
                         continue
 
-                    result = infer(ticker, strategy_type, data_df=data_df, strategy_params=strat_params)
+                    result = infer(ticker, strategy_type, data_df=data_df, strategy_params=strat_params, timeframe_override=timeframe)
 
                     if result and result.get('decision') == "BUY":
                         found_signals.append({
@@ -2141,19 +2398,21 @@ def run_scan(ticker_list: list[str], strategy_list: list[str], progress_callback
 
 @cli.command()
 @click.option('--tickers', '-t', help='Comma-separated list of tickers to scan. Defaults to a list of liquid stocks/ETFs.')
+@click.option('--market', default='us', help='The market to scan for tickers (defaults to US) when tickers are not provided.')
 @click.option('--strategies', '-s', default=','.join(list(STRATEGY_CLASS_MAP.keys())), help='Comma-separated list of strategies to process. Defaults to all available strategies.')
-def scan(tickers, strategies):
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
+def scan(tickers, market, strategies, timeframe):
     """
     Scans a list of tickers for stocks showing bullish setups.
     Saves results to scan_results.json for the dashboard.
     """
     logger.info(f"--- Scanning for setups ---")
-    ticker_list = [t.strip().upper() for t in tickers.split(',')] if tickers else get_default_tickers(limit=100)
+    ticker_list = [t.strip().upper() for t in tickers.split(',')] if tickers else get_default_tickers(limit=100, market=market)
     strategy_list = [s.strip() for s in strategies.split(',')]
     
-    run_scan(ticker_list, strategy_list, stop_event_checker=None)
+    run_scan(ticker_list, strategy_list, timeframe_override=timeframe, stop_event_checker=None)
 
-def _process_batch_job(ticker, strat_type, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, stop_event_checker=None):
+def _process_batch_job(ticker, strat_type, timeframe, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, stop_event_checker=None):
     """Helper function to process a single tune-and-train job and return its metrics."""
     try:
         if stop_event_checker and stop_event_checker():
@@ -2163,7 +2422,7 @@ def _process_batch_job(ticker, strat_type, n_calls, start_date, end_date, commis
         # First, tune strategy parameters
         logger.info(f"Tuning strategy parameters for {ticker} - {strat_type}...")
         run_tune_strategy(
-            ticker=ticker, strategy_type=strat_type, n_calls=n_calls,
+            ticker=ticker, strategy_type=strat_type, timeframe_override=timeframe, n_calls=n_calls,
             start_date=start_date, end_date=end_date, commission=commission,
             max_drawdown=max_drawdown, min_trades=min_trades, min_win_rate=min_win_rate,
             stop_event_checker=stop_event_checker
@@ -2173,7 +2432,7 @@ def _process_batch_job(ticker, strat_type, n_calls, start_date, end_date, commis
         # Check for stop event again before starting the next long process
         logger.info(f"Training model for {ticker} - {strat_type} with tuned strategy parameters...")
         result, _, _ = run_pybroker_walkforward(
-            ticker=ticker, strategy_type=strat_type, start_date=start_date, end_date=end_date,
+            ticker=ticker, strategy_type=strat_type, timeframe_override=timeframe, start_date=start_date, end_date=end_date,
             tune_hyperparameters=True, plot_results=False, save_assets=True,
             use_tuned_strategy_params=True, commission_cost=commission,
             stop_event_checker=stop_event_checker
@@ -2194,29 +2453,30 @@ def _process_batch_job(ticker, strat_type, n_calls, start_date, end_date, commis
         traceback.print_exc()
         return None
 
-def run_batch_train(tickers, strategies, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, min_setups, stop_event_checker=None):
+def run_batch_train(tickers, market, strategies, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, min_setups, timeframe_override, stop_event_checker=None):
     """Core logic for running a batch of tuning and training jobs."""
     logger.info(f"--- Starting Batch Training Process ---")
 
+    if not start_date:
+        start_date = FULL_HISTORY_START_DATE
     if not end_date:
-        end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    timeframe = timeframe_override if timeframe_override else '1d'
+    logger.info(f"Using timeframe: {timeframe}")
+
+    # If no tickers are provided, default to a comprehensive list for discovery.
+    if not tickers:
+        logger.info("No tickers specified. Using default universe of ETFs and candidate stocks for discovery.")
+        tickers = ",".join(get_default_tickers(market=market))
 
     strategy_list = [s.strip() for s in strategies.split(',')]
     
     # --- Step 1: Determine the list of jobs (ticker, strategy) to run ---
     jobs_to_run = []
-    if tickers:
-        ticker_list = [t.strip().upper() for t in tickers.split(',')]
-        for ticker in ticker_list:
-            for strat_type in strategy_list:
-                jobs_to_run.append((ticker, strat_type))
-    else:
-        logger.info("No tickers provided. Discovering tickers via pre-scan...")
+    ticker_list = [t.strip().upper() for t in tickers.split(',')]
+    for ticker in ticker_list:
         for strat_type in strategy_list:
-            logger.info(f"Pre-scanning for {strat_type} setups...")
-            valid_tickers_for_strat, _ = run_pre_scan_universe(None, strat_type, min_setups, start_date, end_date)
-            for ticker in valid_tickers_for_strat:
-                jobs_to_run.append((ticker, strat_type))
+            jobs_to_run.append((ticker, strat_type))
     
     if not jobs_to_run:
         logger.error("No valid ticker/strategy pairs found to process. Aborting.")
@@ -2226,7 +2486,7 @@ def run_batch_train(tickers, strategies, n_calls, start_date, end_date, commissi
 
     results_log_file = os.path.join(WORKING_DIRECTORY, 'batch_train_summary.csv')
 
-    # --- NEW: Check for already completed jobs to make the process resumable ---
+    # --- Check for already completed jobs to make the process resumable ---
     completed_jobs = set()
     if os.path.exists(results_log_file):
         try:
@@ -2257,7 +2517,7 @@ def run_batch_train(tickers, strategies, n_calls, start_date, end_date, commissi
             metrics = _process_batch_job(
                 ticker, strat_type, n_calls, start_date, end_date, 
                 commission, max_drawdown, min_trades, min_win_rate,
-                stop_event_checker=stop_event_checker
+                timeframe=timeframe, stop_event_checker=stop_event_checker
             )
 
             if metrics == "STOPPED":
@@ -2287,21 +2547,23 @@ def run_batch_train(tickers, strategies, n_calls, start_date, end_date, commissi
 
 @cli.command(name='batch-train')
 @click.option('--tickers', '-t', help='Comma-separated list of tickers to process. If omitted, tickers will be discovered via pre-scan.')
+@click.option('--market', default='us', help='The market to scan for tickers (defaults to US) when tickers are not provided.')
 @click.option('--strategies', '-s', default=','.join(list(STRATEGY_CLASS_MAP.keys())), help='Comma-separated list of strategies to process. Defaults to all available strategies.')
+@click.option('--timeframe', default='1d', help='Timeframe for the data (e.g., 1d, 1h).')
 @click.option('--n-calls', default=100, help='Number of tuning iterations per job.')
-@click.option('--start-date', default='2000-01-01', help='Start date for training data.')
+@click.option('--start-date', default=FULL_HISTORY_START_DATE, help='Start date for training data.')
 @click.option('--end-date', default=None, help='End date for training data (defaults to yesterday).')
 @click.option('--commission', default=0.005, help='Commission cost per share (e.g., 0.005).')
 @click.option('--max-drawdown', default=40.0, help='Maximum acceptable drawdown percentage for tuning objective.')
 @click.option('--min-trades', default=20, help='Minimum acceptable trade count for tuning objective.')
 @click.option('--min-win-rate', default=40.0, help='Minimum acceptable win rate for tuning objective.')
 @click.option('--min-setups', default=60, help='Minimum historical setups required for a ticker to be included if pre-scanning.')
-def batch_train(tickers, strategies, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, min_setups):
+def batch_train(tickers, market, strategies, timeframe, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, min_setups):
     """
     Runs a batch of tuning and training jobs and logs the results to a CSV.
     If --tickers is not provided, it will pre-scan to find suitable tickers for each strategy.
     """
-    run_batch_train(tickers, strategies, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, min_setups, stop_event_checker=None)
+    run_batch_train(tickers, market, strategies, n_calls, start_date, end_date, commission, max_drawdown, min_trades, min_win_rate, min_setups, timeframe_override=timeframe, stop_event_checker=None)
 
 if __name__ == '__main__':
     cli()

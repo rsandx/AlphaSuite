@@ -198,7 +198,7 @@ def get_signal_scanner_content():
                         display_text="ℹ️ Info"
                     )
                 },
-                use_container_width=True, hide_index=True
+                width='stretch', hide_index=True
             )
 
             st.subheader("Market Regime Analysis")
@@ -221,7 +221,7 @@ def get_signal_scanner_content():
                     [(strat, strategy_interpretations.get(strat, "No description available.")) for strat in strategy_counts.index],
                     columns=['Strategy', 'Description']
                 )
-                st.dataframe(interpretation_df, hide_index=True, use_container_width=True)
+                st.dataframe(interpretation_df, hide_index=True, width='stretch')
 
 
 def get_generic_scanner_content():
@@ -241,6 +241,8 @@ def get_generic_scanner_content():
         st.session_state.generic_filters = []
     if 'last_scanner_name' not in st.session_state:
         st.session_state.last_scanner_name = ""
+    if 'generic_scan_time' not in st.session_state:
+        st.session_state.generic_scan_time = None
 
     # --- Screener UI ---
     # Move the scanner selection outside the form to allow dynamic parameter updates.
@@ -350,7 +352,7 @@ def get_generic_scanner_content():
                         bb_std_up = st.number_input("Std. Dev. Up", value=2.0, min_value=0.1, step=0.1, key="bb_std_up")
                         bb_std_dn = st.number_input("Std. Dev. Down", value=2.0, min_value=0.1, step=0.1, key="bb_std_dn")
 
-            add_filters_button = st.form_submit_button("Add Configured Filters", use_container_width=True)
+            add_filters_button = st.form_submit_button("Add Configured Filters", width='stretch')
 
         if add_filters_button:
             # Clear filters before adding new ones to prevent duplicates from multiple clicks
@@ -428,11 +430,11 @@ def get_generic_scanner_content():
                     continue
                 cols = st.columns([5, 1])
                 cols[0].info(f['display'])
-                if cols[1].button("Remove", key=f"remove_{i}", use_container_width=True):
+                if cols[1].button("Remove", key=f"remove_{i}", width='stretch'):
                     st.session_state.generic_filters.pop(i)
                     st.rerun()
 
-        run_scanner = st.button("Run Generic Screener", use_container_width=True, type="primary", disabled=DEMO_MODE)
+        run_scanner = st.button("Run Generic Screener", width='stretch', type="primary", disabled=DEMO_MODE)
         # Pass the list of filters and define which columns to show in the output
         params = {
             'filters': st.session_state.generic_filters,
@@ -461,6 +463,7 @@ def get_generic_scanner_content():
                             scanner_instance = scanner_class(params=full_params)
                             results_df = scanner_instance.run_scan(db)
                             st.session_state.generic_scanner_results_df = results_df
+                            st.session_state.generic_scan_time = datetime.now()
                             st.success(f"Scan complete! Found {len(results_df)} results.")
                         except Exception as e:
                             st.error(f"An error occurred while running the scanner: {e}")
@@ -502,7 +505,7 @@ def get_generic_scanner_content():
                                 label=p_def['label'], 
                                 options=p_def.get('options', []))
             
-            run_scanner = st.form_submit_button("Run Scanner", use_container_width=True, disabled=DEMO_MODE)
+            run_scanner = st.form_submit_button("Run Scanner", width='stretch', disabled=DEMO_MODE)
             
             if run_scanner:
                 if scanner_class:
@@ -514,6 +517,7 @@ def get_generic_scanner_content():
                             scanner_instance = scanner_class(params=full_params)
                             results_df = scanner_instance.run_scan(db)
                             st.session_state.generic_scanner_results_df = results_df
+                            st.session_state.generic_scan_time = datetime.now()
                             st.success(f"Scan complete! Found {len(results_df)} results.")
                         except Exception as e:
                             st.error(f"An error occurred while running the scanner: {e}")
@@ -525,7 +529,10 @@ def get_generic_scanner_content():
     # --- Results Display ---
     if not st.session_state.generic_scanner_results_df.empty:
         results_df = st.session_state.generic_scanner_results_df
-        st.subheader("Scanner Results")
+        if st.session_state.generic_scan_time:
+            st.subheader(f"Scanner Results ({st.session_state.generic_scan_time.strftime('%Y-%m-%d %H:%M:%S')})")
+        else:
+            st.subheader("Scanner Results")
         if results_df.empty:
             st.success("✅ No stocks matched your criteria.")
         else:
@@ -535,7 +542,7 @@ def get_generic_scanner_content():
 
             st.dataframe(
                 results_df, 
-                use_container_width=True, 
+                width='stretch', 
                 hide_index=True,
                 column_config={
                     "stockcharts": st.column_config.LinkColumn(
