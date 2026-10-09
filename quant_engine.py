@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 import traceback
 
 from tools.file_wrapper import convert_to_json_serializable
-from tools.yfinance_tool import get_earnings_dates, load_price_data, load_ticker_data
+from tools.data_manager import DataManager
 from pybroker_trainer.strategy_loader import load_strategy_class, get_strategy_defaults, get_strategy_tuning_space, STRATEGY_CLASS_MAP
 from load_cfg import WORKING_DIRECTORY
 from core.logging_config import setup_logging
@@ -98,12 +98,13 @@ def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_par
     """
     logger.info(f"Preparing base data for {ticker} from {start_date} to {end_date}...")
     
-    data_df = load_price_data(ticker, start_date, end_date, timeframe)
-    if data_df.empty:
-        logger.error(f"No data found for {ticker} between {start_date} and {end_date}. Returning empty DataFrame.")
+    price_data = DataManager().load_price_data(ticker, start_date, end_date, timeframe)
+    if "error" in price_data:
+        logger.error(f"Error loading price data for {ticker} between {start_date} and {end_date}: {price_data['error']}. Returning empty DataFrame.")
         return pd.DataFrame()
 
     # Calculate Buy-and-Hold Performance for the period
+    data_df = price_data.get('shareprices')
     if not data_df.empty:
         buy_and_hold_return_pct = 0.0
         first_price = data_df['adjclose'].iloc[0]
@@ -127,7 +128,7 @@ def _prepare_base_data(ticker: str, start_date: str, end_date: str, strategy_par
     include_earnings_dates = strategy_params.get('include_earnings_dates', False)
     if include_earnings_dates:
         try:
-            earnings_dates = get_earnings_dates(ticker)
+            earnings_dates = DataManager().get_analyst_data(ticker, 'earnings_dates')
             if isinstance(earnings_dates, dict) and "error" in earnings_dates:
                 logger.warning(f"Could not fetch earnings dates for {ticker}. Error: {earnings_dates['error']}. Skipping pre-earnings features.")
             elif earnings_dates is not None and not earnings_dates.empty:
@@ -275,14 +276,13 @@ def plot_performance_vs_benchmark(result: TestResult, title: str, ticker: Option
         start_date = result.start_date.strftime('%Y-%m-%d')
         end_date = result.end_date.strftime('%Y-%m-%d')
         logger.info(f"Loading benchmark data for {benchmark_ticker}...")
-        data_dict = load_ticker_data(benchmark_ticker, start_date, end_date, timeframe)
+        data_dict = DataManager().load_price_data(benchmark_ticker, start_date, end_date, timeframe)
         if data_dict and 'shareprices' in data_dict and not data_dict['shareprices'].empty:
             price_data = data_dict['shareprices']
-            price_data = price_data.set_index('Date')
             initial_capital = portfolio_df['market_value'].iloc[0]
     
             # 1. Get the series
-            benchmark_series = price_data['Adj Close'].copy()
+            benchmark_series = price_data['adjclose'].copy()
              
             # 2. Fix the index type safely
             # We access the index directly, convert to datetime, and strip timezone info
@@ -413,7 +413,7 @@ def plot_trades_on_chart(result: TestResult, ticker: str, timeframe: str, title:
     start_date = result.start_date.strftime('%Y-%m-%d')
     end_date = result.end_date.strftime('%Y-%m-%d')
     
-    data_dict = load_ticker_data(ticker, start_date, end_date, timeframe)
+    data_dict = DataManager().load_price_data(ticker, start_date, end_date, timeframe)
     if not data_dict or 'shareprices' not in data_dict or data_dict['shareprices'] is None:
         logger.error(f"Could not load price data for {ticker} to plot trades.")
         return None
@@ -423,14 +423,8 @@ def plot_trades_on_chart(result: TestResult, ticker: str, timeframe: str, title:
         logger.error(f"Price data DataFrame is empty for {ticker}.")
         return None
     
-    if 'Date' in price_data.columns:
-        price_data['Date'] = pd.to_datetime(price_data['Date'])
-        price_data = price_data.set_index('Date')
-    elif not isinstance(price_data.index, pd.DatetimeIndex):
-        price_data.index = pd.to_datetime(price_data.index)
-
     fig, ax = plt.subplots(figsize=(15, 7))
-    ax.plot(price_data.index, price_data['Adj Close'], label=f'{ticker} Price', color='skyblue', alpha=0.7, zorder=1)
+    ax.plot(price_data.index, price_data['adjclose'], label=f'{ticker} Price', color='skyblue', alpha=0.7, zorder=1)
 
     # Separate winning and losing trades for different coloring
     winning_trades = trades_df[trades_df['pnl'] > 0]
@@ -1501,7 +1495,7 @@ def infer(ticker: str, strategy_type: str, data_df: pd.DataFrame = None, strateg
     # --- If BUY signal, calculate actionable trade parameters ---
     if inference_result["decision"] == "BUY":
         logger.info("BUY signal detected. Calculating trade parameters...")
-        trader = strategy_instance.get_trader(model_name=None, params_map={ticker: strategy_params}, data_source=data_df, start_date=start_date, end_date=end_date)
+        trader = strategy_instance.get_trader(model_name=None, params_map={ticker: strategy_params})
         
         # Create a mock context for the last bar
         last_loc = len(data_df) - 1

@@ -21,10 +21,9 @@ from sqlalchemy import func
 
 from core.db import close_database, get_db, initialize_database_schema
 from core.model import Company, Exchange, PriceHistory
-from tools.yfinance_tool import find_tickers_with_splits_in_db, refresh_split_tickers
 from core.logging_config import setup_logging
 from tools.scanner_tool import calculate_and_save_common_values_for_scanner, find_strongest_stocks_in_strongest_industries
-from tools.yfinance_tool import load_ticker_data, save_or_update_company_data
+from tools.data_manager import DataManager
 
 # --- Logging Configuration ---
 setup_logging('download_data.log')
@@ -90,7 +89,7 @@ def run_daily_pipeline():
         logger.info(f"--- Processing {market.upper()} Market ---")
 
         logger.info(f"Updating {market.upper()} market prices...")
-        save_or_update_company_data(market=market, existing_tickers_action='only', update_prices_action='last_day', batch_size=1000)
+        DataManager().save_or_update_company_data(market=market, existing_tickers_action='only', update_prices_action='last_day', batch_size=1000)
         
         logger.info(f"Calculating {market.upper()} common values...")
         calculate_and_save_common_values_for_scanner(market=market)
@@ -100,7 +99,7 @@ def run_full_download(market, exchange, quote_types, ticker_file, batch_size, st
     """Wraps the main save_or_update_company_data function to be callable."""
     logger.info(f"--- Starting Full Download/Update for market: {market} ---")
     # The main function already has extensive logging, so we just call it.
-    save_or_update_company_data(
+    DataManager().save_or_update_company_data(
         market=market, exchange=exchange, quote_types=quote_types,
         ticker_file=ticker_file, batch_size=batch_size,
         start_date=start_date, end_date=end_date,
@@ -115,7 +114,7 @@ def run_range_download(market, exchange, quote_types, ticker_file, batch_size, s
     """
     logger.info(f"--- Starting Range Download for market: {market}, from {start_date} to {end_date} ---")
     # The main function already has extensive logging, so we just call it.
-    save_or_update_company_data(
+    DataManager().save_or_update_company_data(
         market=market, exchange=exchange, quote_types=quote_types,
         ticker_file=ticker_file, batch_size=batch_size,
         start_date=start_date, end_date=end_date,
@@ -158,7 +157,7 @@ def run_scanner(scanner_name, market, min_avg_volume):
 def run_refresh_ticker(ticker):
     """Wraps the load_ticker_data function for a single ticker refresh."""
     logger.info(f"--- Refreshing data for ticker: {ticker} ---")
-    result = load_ticker_data(ticker, refresh=True)
+    result = DataManager().load_ticker_data(ticker, refresh=True)
     if not result or 'shareprices' not in result or result['shareprices'].empty:
         logger.info(f"No data found or failed to refresh for {ticker}")
     else:
@@ -181,7 +180,7 @@ def run_fix_split_data(market, batch_size):
 
         # Step 2: Use the shared function to find which of these have had splits in the last 2 years.
         two_years_ago = datetime.datetime.now() - datetime.timedelta(days=730)
-        tickers_to_fix = find_tickers_with_splits_in_db(db, company_ids, two_years_ago)
+        tickers_to_fix = DataManager().find_tickers_with_splits_in_db(db, company_ids, two_years_ago)
         
         if not tickers_to_fix:
             logger.info("No tickers with recent splits found. Database is consistent.")
@@ -190,14 +189,14 @@ def run_fix_split_data(market, batch_size):
         # Step 3: Call the centralized refresh function with the identified tickers.
         logger.info(f"Found {len(tickers_to_fix)} tickers with recent splits to refresh: {[t.symbol for t in tickers_to_fix]}")
         ticker_map = {c.symbol: c.id for c in tickers_to_fix}
-        refresh_split_tickers(db, ticker_map, batch_size)
+        DataManager().refresh_split_tickers(db, ticker_map, batch_size)
     finally:
         db.close()
     logger.info("--- Historical Split Data Fix Finished ---")
 
 def find_earliest_latest_date_for_market(market):
     """
-    Finds the earliest of the latest '1d' price history dates for a given market.
+    Finds the earliest of the latest '1d' price history timestamps for a given market.
 
     This is useful for finding the oldest "last updated" date among a group of stocks
     to pre-fill the start date for gap-filling downloads.
@@ -214,21 +213,21 @@ def find_earliest_latest_date_for_market(market):
     """
     with next(get_db()) as db:
         try:
-            # 1. Find the latest date for each company
+            # 1. Find the latest timestamp for each company
             latest_dates_per_company = db.query(
                 PriceHistory.company_id,
-                func.max(PriceHistory.date).label('latest_date')
-            ).group_by(PriceHistory.company_id).subquery()
+                func.max(PriceHistory.timestamp).label('latest_timestamp')
+            ).filter(PriceHistory.timeframe == '1d').group_by(PriceHistory.company_id).subquery()
 
             # 2. Join with Company and Exchange to filter by market and active status
-            # 3. Find the earliest of the latest dates
-            earliest_latest_result = db.query(func.min(latest_dates_per_company.c.latest_date)).\
+            # 3. Find the earliest of the latest timestamps
+            earliest_latest_result = db.query(func.min(latest_dates_per_company.c.latest_timestamp)).\
                 join(Company, Company.id == latest_dates_per_company.c.company_id).\
                 join(Exchange, Company.exchange == Exchange.exchange_code).\
                 filter(Exchange.country_code == market, Company.isactive == True).scalar()
 
             if earliest_latest_result:
-                return earliest_latest_result
+                return earliest_latest_result.date()
             else:
                 logger.warning(f"No price history data found for market '{market}'.")
                 return None

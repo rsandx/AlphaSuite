@@ -14,16 +14,14 @@ import logging
 import numpy as np
 import pandas as pd
 import traceback, operator
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
-from sklearn.neighbors import NearestNeighbors
 from sqlalchemy import func, update, desc
 from sqlalchemy.orm import Session
 from scipy import stats
 
 from core.db import get_db
 from core.model import Company, Exchange, Financials, PriceHistory, object_as_dict
+from tools.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
@@ -43,29 +41,29 @@ canslim_scan_criteria = {
 }
 
 index_name_mapping = {
-    "Total Revenue": ["Total Revenue", "TotalRevenue", "Revenue", "Total Revenues", "Total Revenues"],
-    "Net Income": ["Net Income", "NetIncome", "Net Profit", "Net Earnings", "Net Income Continuous Operations", "NetIncomeContinuousOperations", "Net Income Discontinuous Operations", "NetIncomeDiscontinuousOperations","Net Income Common Stockholders", "NetIncomeCommonStockholders", "Net Income From Continuing And Discontinued Operation", "NetIncomeFromContinuingAndDiscontinuedOperation", "Net Income From Continuing Operation Net Minority Interest", "NetIncomeFromContinuingOperationNetMinorityInterest","Net Income Including Noncontrolling Interests", "NetIncomeIncludingNoncontrollingInterests"],
+    "Total Revenue": ["Total Revenue", "TotalRevenue", "Revenue", "Total Revenues", "Total Revenues", "totalRevenue"],
+    "Net Income": ["Net Income", "NetIncome", "Net Profit", "Net Earnings", "Net Income Continuous Operations", "NetIncomeContinuousOperations", "Net Income Discontinuous Operations", "NetIncomeDiscontinuousOperations","Net Income Common Stockholders", "NetIncomeCommonStockholders", "Net Income From Continuing And Discontinued Operation", "NetIncomeFromContinuingAndDiscontinuedOperation", "Net Income From Continuing Operation Net Minority Interest", "NetIncomeFromContinuingOperationNetMinorityInterest","Net Income Including Noncontrolling Interests", "NetIncomeIncludingNoncontrollingInterests", "netIncome"],
     "Shares (Diluted)": ["Shares (Diluted)", "SharesDiluted", "Diluted Average Shares", "DilutedAverageShares", "Weighted Average Diluted Shares", "WeightedAverageDilutedShares", "DilutedShares", "Diluted Shares"],
-    "Operating Income": ["Operating Income", "OperatingIncome"], 
+    "Operating Income": ["Operating Income", "OperatingIncome", "operatingIncome"], 
     "Basic Average Shares": ["Basic Average Shares", "BasicAverageShares"],
-    "EBIT": ["EBIT"], 
+    "EBIT": ["EBIT", "ebit"], 
     "Interest Expense": ["Interest Expense", "InterestExpense"],
-    "Dividends Paid": ["Dividends Paid", "DividendsPaid", "CashDividendsPaid"], 
-    "Cost Of Revenue": ["Cost Of Revenue", "CostOfRevenue"],
-    "Operating Cash Flow": ["Operating Cash Flow", "OperatingCashFlow"],
-    "Capital Expenditures": ["Capital Expenditures", "CapitalExpenditures", "CapitalExpenditure"],
-    "Free Cash Flow": ["Free Cash Flow", "FreeCashFlow"],
+    "Dividends Paid": ["Dividends Paid", "DividendsPaid", "CashDividendsPaid", "dividendsPaid"], 
+    "Cost Of Revenue": ["Cost Of Revenue", "CostOfRevenue", "costOfRevenue"],
+    "Operating Cash Flow": ["Operating Cash Flow", "OperatingCashFlow", "totalCashFromOperatingActivities"],
+    "Capital Expenditures": ["Capital Expenditures", "CapitalExpenditures", "CapitalExpenditure", "capitalExpenditures"],
+    "Free Cash Flow": ["Free Cash Flow", "FreeCashFlow", "freeCashFlow"],
     "Short Term Debt": ["Short Term Debt", "ShortTermDebt", "Short Long Term Debt", "Current Debt", "CurrentDebt", "CurrentDebtAndCapitalLeaseObligation", "Commercial Paper"],
-    "Long Term Debt": ["Long Term Debt", "LongTermDebt", "Long Term Liabilities", "Deferred Long Term Liabilities", "Long Term Debt And Capital Lease Obligation", "LongTermDebtAndCapitalLeaseObligation"],
-    "Total Equity": ["Total Equity", "TotalEquity", "Stockholders Equity", "StockholdersEquity", "Total Stockholders Equity", "Other Stockholders Equity"],
+    "Long Term Debt": ["Long Term Debt", "LongTermDebt", "Long Term Liabilities", "Deferred Long Term Liabilities", "Long Term Debt And Capital Lease Obligation", "LongTermDebtAndCapitalLeaseObligation", "longTermDebt"],
+    "Total Equity": ["Total Equity", "TotalEquity", "Stockholders Equity", "StockholdersEquity", "Total Stockholders Equity", "Other Stockholders Equity", "totalStockholderEquity"],
     "Current Assets": ["Current Assets", "CurrentAssets", "Total Current Assets", "Other Current Assets", "Current Deferred Assets"],
-    "Total Assets": ["Total Assets", "TotalAssets"],
+    "Total Assets": ["Total Assets", "TotalAssets", "totalAssets"],
     "Current Liabilities": ["Current Liabilities", "CurrentLiabilities", "Total Current Liabilities", "Other Current Liabilities", "Current Deferred Liabilities"],
-    "Total Liabilities": ["Total Liabilities", "TotalLiabilitiesNetMinorityInterest", "Other Liabilities", "Total Non Current Liabilities", "DeferredTaxLiabilities", "Total Liabilities Net Minority Interest"],
-    "Cash And Equivalent": ["Cash Cash Equivalents And Short Term Investments", "CashAndCashEquivalents", "Cash Equivalents", "Cash Cash Equivalents And Federal Funds Sold"],
+    "Total Liabilities": ["Total Liabilities", "TotalLiabilitiesNetMinorityInterest", "Other Liabilities", "Total Non Current Liabilities", "DeferredTaxLiabilities", "Total Liabilities Net Minority Interest", "totalLiab"],
+    "Cash And Equivalent": ["Cash Cash Equivalents And Short Term Investments", "CashAndCashEquivalents", "Cash Equivalents", "Cash Cash Equivalents And Federal Funds Sold", "cash"],
     "Receivables": ["Receivables", "Other Receivables", "Non Current Accounts Receivable", "Accounts Receivable", "Gross Accounts Receivable", "AccountsReceivable"],
     "Payables": ["Payables", "TaxPayables", "Accounts Payable", "Other Payable", "AccountsPayable", "PayablesAndAccruedExpenses", "TradeandOtherPayablesNonCurrent"],
-    "Inventory": ["Inventory", "Finished Goods", "Raw Materials", "Other Inventories"],
+    "Inventory": ["Inventory", "Finished Goods", "Raw Materials", "Other Inventories", "inventory"],
 }
 
 def standardize_index_names(df, index_name_mapping):
@@ -160,6 +158,8 @@ def calculate_and_save_common_values_for_scanner(market: str = "us", tickers: li
     """ Calculates and saves common values for all companies in the specified market. """
     db = next(get_db())
     try:
+        if tickers:
+            tickers = DataManager().resolve_symbols_batch(tickers)
         # Get all companies in the specified market
         if market and tickers:
             companies = db.query(Company).filter(Company.isactive == True, Company.symbol.in_(tickers), Company.exchange.in_(db.query(Exchange.exchange_code).filter(Exchange.country_code == market))).all()
@@ -622,7 +622,7 @@ def calculate_average_daily_volume(db: Session, company_ids: list[int], batch_si
         # Get the last 200 days of volume for each company
         volume_data = db.query(PriceHistory).filter(
             PriceHistory.company_id.in_(batch_ids)
-        ).order_by(PriceHistory.date.desc()).limit(200 * len(batch_ids)).all()
+        ).order_by(PriceHistory.timestamp.desc()).limit(200 * len(batch_ids)).all()
 
         if not volume_data:
             logger.warning(f"No data found for companies: {batch_ids}")
@@ -713,7 +713,7 @@ def calculate_price_relative_to_52week_high(db: Session, company_ids: list[int],
         subquery_last_price = (
             db.query(
                 PriceHistory.company_id,
-                func.max(PriceHistory.date).label("max_date"),
+                func.max(PriceHistory.timestamp).label("max_date"),
             )
             .filter(PriceHistory.company_id.in_(batch_ids))
             .group_by(PriceHistory.company_id)
@@ -721,11 +721,11 @@ def calculate_price_relative_to_52week_high(db: Session, company_ids: list[int],
         )
 
         last_prices = (
-            db.query(PriceHistory.company_id, PriceHistory.adjclose, PriceHistory.volume, PriceHistory.date)
+            db.query(PriceHistory.company_id, PriceHistory.adjclose, PriceHistory.volume, PriceHistory.timestamp)
             .join(
                 subquery_last_price,
                 (PriceHistory.company_id == subquery_last_price.c.company_id)
-                & (PriceHistory.date == subquery_last_price.c.max_date),
+                & (PriceHistory.timestamp == subquery_last_price.c.max_date),
             )
             .subquery()
         )
@@ -738,7 +738,7 @@ def calculate_price_relative_to_52week_high(db: Session, company_ids: list[int],
             )
             .filter(
                 PriceHistory.company_id.in_(batch_ids),
-                PriceHistory.date >= a_year_ago_date
+                PriceHistory.timestamp >= a_year_ago_date
             )
             .group_by(PriceHistory.company_id)
             .subquery()
@@ -888,10 +888,10 @@ def calculate_relative_strength_percentile(db: Session, company_ids: list[int], 
     today = pd.Timestamp.today(tz="UTC")
     past_date = today - pd.Timedelta(days=max(time_periods.values()))
 
-    benchmark_data = db.query(PriceHistory.adjclose, PriceHistory.date).filter(
+    benchmark_data = db.query(PriceHistory.adjclose, PriceHistory.timestamp).filter(
         PriceHistory.company_id == db.query(Company.id).filter(Company.symbol == benchmark_symbol).scalar_subquery(),
-        PriceHistory.date >= past_date,
-        PriceHistory.date <= today
+        PriceHistory.timestamp >= past_date,
+        PriceHistory.timestamp <= today
     ).all()
 
     if not benchmark_data:
@@ -939,10 +939,10 @@ def calculate_relative_strength_percentile(db: Session, company_ids: list[int], 
         logger.info(f"Processing batch {i // batch_size + 1} of companies: {len(batch_ids)} companies")
 
         # Get all prices for the current batch of companies
-        price_data = db.query(PriceHistory.company_id, PriceHistory.adjclose, PriceHistory.date).filter(
+        price_data = db.query(PriceHistory.company_id, PriceHistory.adjclose, PriceHistory.timestamp).filter(
             PriceHistory.company_id.in_(batch_ids),
-            PriceHistory.date >= past_date,
-            PriceHistory.date <= today
+            PriceHistory.timestamp >= past_date,
+            PriceHistory.timestamp <= today
         ).all()
 
         if not price_data:
@@ -1053,9 +1053,9 @@ def calculate_expanding_volume(db: Session, company_ids: list[int], batch_size=2
         logger.info(f"Processing volume metrics for batch {i // batch_size + 1} of companies: {len(batch_ids)} companies")
 
         # Get price and volume data for the current batch of companies
-        volume_data = db.query(PriceHistory.company_id, PriceHistory.date, PriceHistory.volume).filter(
+        volume_data = db.query(PriceHistory.company_id, PriceHistory.timestamp, PriceHistory.volume).filter(
             PriceHistory.company_id.in_(batch_ids),
-            PriceHistory.date >= past_date
+            PriceHistory.timestamp >= past_date
         ).all()
 
         if not volume_data:
@@ -1646,174 +1646,6 @@ def find_strongest_stocks_in_strongest_industries(market="us", top_n_industries=
         strongest_stocks = []
 
     return strongest_industries
-
-def find_top_competitors(symbol: str, num_competitors: int = 5, yf_competitors: list[str] = []) -> list[dict]:
-    """
-    Finds the top competitors in the same market and industry of a given stock symbol.
-    Uses a more relaxed filtering approach and improved handling of missing data.  Prioritizes yf_competitors.
-
-    Args:
-        symbol: The stock symbol to find competitors for.
-        num_competitors: The number of competitors to consider.
-        yf_competitors: A list of symbols from Yahoo Finance to include in the search.
-
-    Returns:
-        A list of competitors with their corresponding symbol and distance.
-    """
-    db = next(get_db())
-    try:
-        company = db.query(Company).filter(Company.symbol == symbol).first()
-        if not company:
-            logger.warning(f"Company with symbol {symbol} not found.")
-            return []
-
-        if not company.market or not company.industry:
-            logger.warning(f"Company {symbol} is missing market or industry information.")
-            return []
-
-        # Fetch yf_competitors first
-        yf_competitors_data = []
-        if yf_competitors:
-            yf_competitors_data = db.query(
-                Company.id,
-                Company.symbol,
-                Company.longbusinesssummary,
-                Company.marketcap,
-                Company.totalrevenue,
-                Company.enterprisevalue,
-                Company.website
-            ).filter(
-                Company.id != company.id,
-                Company.website != company.website,
-                Company.market == company.market,
-                Company.exchange == company.exchange,
-                Company.industry == company.industry,
-                Company.longbusinesssummary != None,
-                Company.symbol.in_(yf_competitors)
-            ).distinct(Company.website).all() # filter with unique website
-
-        # Add company_industry_data only if needed
-        num_yf_competitors = len(yf_competitors_data)
-        num_additional_competitors = max(0, num_competitors * 3 - num_yf_competitors)
-
-        if num_additional_competitors > 0:
-            company_industry_data = db.query(
-                Company.id,
-                Company.symbol,
-                Company.longbusinesssummary,
-                Company.marketcap,
-                Company.totalrevenue,
-                Company.enterprisevalue,
-                Company.website
-            ).filter(
-                Company.id != company.id,
-                Company.website != company.website,
-                Company.market == company.market,
-                Company.exchange == company.exchange,
-                Company.industry == company.industry,
-                Company.longbusinesssummary != None,
-                Company.symbol.notin_(yf_competitors)
-            ).distinct(Company.website).all() # filter with unique website
-
-            yf_competitors_data.extend(company_industry_data)
-
-        if not yf_competitors_data:
-            logger.warning(f"No competitors found for {symbol} in the same market and industry.")
-            return []
-
-        df = pd.DataFrame(
-            yf_competitors_data,
-            columns=['company_id', 'symbol', 'longbusinesssummary', 'marketcap', 'totalrevenue', 'enterprisevalue', 'website']
-        )
-
-        # Vectorize 'longBusinessSummary' using TF-IDF
-        vectorizer = TfidfVectorizer(stop_words='english')
-        text_features = vectorizer.fit_transform(df['longbusinesssummary']).toarray()
-        text_features_df = pd.DataFrame(text_features, index=df.index, columns=[f"tfidf_{i}" for i in range(text_features.shape[1])])
-
-        # Numerical features
-        numerical_cols = ['marketcap', 'totalrevenue', 'enterprisevalue']
-        df[numerical_cols] = df[numerical_cols].fillna(0)
-
-        # Impute missing numerical values
-        imputer = SimpleImputer(strategy="mean")
-        df[numerical_cols] = imputer.fit_transform(df[numerical_cols])
-
-        # Scale numerical features
-        scaler = StandardScaler()
-        df[numerical_cols] = scaler.fit_transform(df[numerical_cols])
-
-        # Concatenate numerical and text features
-        df = df.drop(columns=['longbusinesssummary'])
-        df = pd.concat([df, text_features_df], axis=1)
-
-        # Prepare data for KNN (excluding symbol and company_id)
-        knn_data = df.drop(columns=['symbol', 'company_id', 'website']).copy()
-        if knn_data.isnull().values.any():
-            logger.error("NaN values found in knn_data before fitting KNN.")
-            # Impute again just in case
-            numeric_cols_knn = knn_data.select_dtypes(include=np.number).columns
-            imputer_knn = SimpleImputer(strategy="mean")
-            knn_data[numeric_cols_knn] = imputer_knn.fit_transform(knn_data[numeric_cols_knn])
-            if knn_data.isnull().values.any():
-                raise ValueError("NaN values persist in knn_data after imputation.")
-            raise ValueError("NaN values found in knn_data before fitting KNN.")
-
-        # Fit KNN
-        knn = NearestNeighbors(n_neighbors=min(num_competitors * 5, len(df)), metric='euclidean') # get more neighbors to be able to filter them
-        knn.fit(knn_data)
-
-        # Create a DataFrame for the target company
-        target_company_df = pd.DataFrame([{
-            'marketcap': company.marketcap,
-            'totalrevenue': company.totalrevenue,
-            'enterprisevalue': company.enterprisevalue
-        }])
-
-        # Impute and scale the target company's numerical data
-        target_company_df[numerical_cols] = imputer.transform(target_company_df[numerical_cols])
-        target_company_df[numerical_cols] = scaler.transform(target_company_df[numerical_cols])
-
-        # Correctly vectorize the target company's business summary
-        if company.longbusinesssummary:
-            target_text_features = vectorizer.transform([company.longbusinesssummary]).toarray()
-        else:
-            target_text_features = np.zeros((1, text_features.shape[1]))
-        target_text_features_df = pd.DataFrame(target_text_features, columns=[f"tfidf_{i}" for i in range(text_features.shape[1])])
-
-        # Concatenate numerical and text features for the target company
-        target_company_data = pd.concat([target_company_df, target_text_features_df], axis=1)
-
-        distances, indices = knn.kneighbors(target_company_data)
-
-        # Extract the symbols and distances of the nearest neighbors, applying priority to yf_competitors
-        competitors = []
-        for i, dist in zip(indices[0], distances[0]):
-            competitor_symbol = df.iloc[i]['symbol']
-            is_yf_competitor = competitor_symbol in yf_competitors
-
-            # Apply Priority Weighting: Reduce distance for yf_competitors
-            priority_weight = 0.5 if is_yf_competitor else 1.0  # Adjust weight as needed
-
-            # --- Apply Penalty ---
-            penalty = 0
-            for col in numerical_cols:
-                diff = np.std(abs(df.iloc[i][col] - target_company_df[col].iloc[0]))
-                if diff > 1: # if the difference is more than 1 standard deviation
-                    penalty += diff * 0.5 # add a penalty to the distance
-
-            competitors.append({"ticker": competitor_symbol, "distance": float(dist * priority_weight + penalty)})
-
-        # Sort by distance (including penalty) and take the top N
-        competitors.sort(key=lambda x: x['distance'])
-        return competitors[:num_competitors]
-
-    except Exception as e:
-        logger.error(f"An error occurred in find_top_competitors: {e}")
-        traceback.print_exc()
-        return []
-    finally:
-        db.close()
 
 
 class FundamentalScoreCalculator:

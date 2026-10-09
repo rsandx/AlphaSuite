@@ -12,9 +12,10 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 # --- Model Configuration ---
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview')
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3') # IMPORTANT: Make sure you have pulled this model in Ollama
+EODHD_API_KEY = os.getenv('EODHD_API_KEY')
 
 def get_llm():
     """

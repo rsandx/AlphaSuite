@@ -16,7 +16,7 @@ from tools.file_wrapper import generate_filename
 from tools.canslim_analysis_tool import get_stock_trend
 from tools.scanner_tool import calculate_and_save_common_values, find_relative_strength_percentile, find_top_competitors
 from tools.sentiment_tool import analyze_sentiment
-from tools.yfinance_tool import get_yf_competitors, load_ticker_data
+from tools.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +269,7 @@ class FinancialAnalysisTool:
         try:
             results = {}
 
-            result = load_ticker_data(ticker, refresh=False)
+            result = DataManager().load_ticker_data(ticker, refresh=False)
             if not result:
                 raise ValueError(f"No data found for {ticker}")
 
@@ -321,7 +321,6 @@ class FinancialAnalysisTool:
             "P/S Ratio", "P/B Ratio", "Dividend Yield", "Enterprise Value",
             "Enterprise to Revenue", "Enterprise to EBITDA"
         ]
-        db = next(get_db())
         try:
             results = self.calculate_fundamental_metrics_from_db(ticker)
             if isinstance(results, dict) and "error" in results:
@@ -337,8 +336,6 @@ class FinancialAnalysisTool:
         except Exception as e:
             logger.error(f"Error calculating financial ratios for {ticker}: {e}", exc_info=True)
             return {"error": f"Error calculating ratios from DB: {e}"}
-        finally:
-            db.close()
 
 
     def analyze_financial_health_from_db(self, ticker: str) -> dict:
@@ -438,7 +435,6 @@ class FinancialAnalysisTool:
             "Enterprise Value", "Enterprise to Revenue", "Enterprise to EBITDA",
             "Dividend Yield"
         ]
-        db = next(get_db())
         try:
             results = self.calculate_fundamental_metrics_from_db(ticker)
             if isinstance(results, dict) and "error" in results:
@@ -451,8 +447,6 @@ class FinancialAnalysisTool:
         except Exception as e:
             logger.error(f"Error calculating valuation metrics for {ticker}: {e}", exc_info=True)
             return {"error": f"Error calculating valuation metrics from DB: {e}"}
-        finally:
-            db.close()
 
 
     def generate_fundamental_ratios_table(self, metrics: dict):
@@ -597,16 +591,16 @@ class FinancialAnalysisTool:
         main_ticker_metrics.update(valuation_metrics)
         competitor_data[ticker] = main_ticker_metrics
 
-        yf_competitors = get_yf_competitors(ticker)
-        if isinstance(yf_competitors, dict) and "error" in yf_competitors:
-            logger.warning(f"Error getting competitors for {ticker}: {yf_competitors['error']}")
-            yf_competitors = []
+        extra_competitors = DataManager().get_extra_competitors(ticker)
+        if isinstance(extra_competitors, dict) and "error" in extra_competitors:
+            logger.warning(f"Error getting competitors for {ticker}: {extra_competitors['error']}")
+            extra_competitors = []
 
-        competitors = find_top_competitors(ticker, yf_competitors=yf_competitors)
+        competitors = DataManager().find_top_competitors(ticker, extra_competitors=extra_competitors)
         if competitors:
             for competitor_info in competitors:
                 cticker = competitor_info["ticker"]
-                company_info = load_ticker_data(cticker, refresh=False)
+                company_info = DataManager().load_ticker_data(cticker, refresh=False)
                 if not company_info:
                     logger.error(f"No data found for {cticker}")
                     continue

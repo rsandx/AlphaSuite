@@ -34,9 +34,11 @@ class ChartingTool():
 
             period = chart_specifications.get("period", "daily")
             df = pd.DataFrame(data[period])
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.set_index('Date')
-
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df["Date"] = pd.to_datetime(df.index)
+                df = df.set_index('Date')
+                df = df.sort_index(ascending=True) 
+            
             chart_type = chart_specifications.get("chart_type", "line")
 
             if chart_type == "candlestick":
@@ -87,6 +89,7 @@ class ChartingTool():
 
         except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError) as e:
             logger.error(f"Error creating chart: {e}\n{traceback.format_exc()}")
+            plt.close('all') # CRITICAL: Close all figures to prevent memory leaks on error
             return {"error": f"Error creating chart: {e}"}
 
     def _create_candlestick_chart(self, df: pd.DataFrame, chart_specifications: dict) -> dict:
@@ -114,14 +117,15 @@ class ChartingTool():
             'SMA_50':      {'panel': 0, 'color': 'green',  'type': 'line'},
             'EMA':         {'panel': 0, 'color': 'red',    'type': 'line'}, # Generic EMA catch-all
         }
-        # Columns to explicitly ignore
-        ignore_cols = {'ATR', 'Pct_Change', 'CDL', 'Open', 'High', 'Low', 'Close', 'Volume'}
 
-        df_chart = df.iloc[-300:]  # Limit data points for readability
+        max_points = chart_specifications.get("max_points", 1000)
+        df_chart = df.iloc[-max_points:] 
         addplots = []
+        ignore_cols = {'ATR', 'Pct_Change', 'CDL', 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close'}
 
         for col in df_chart.columns:
-            if any(col.startswith(key) for key in ignore_cols):
+            # Check if the column is in our ignore list
+            if col in ignore_cols:
                 continue
 
             config = None

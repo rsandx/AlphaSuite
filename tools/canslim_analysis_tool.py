@@ -17,11 +17,10 @@ from tools.scanner_tool import (
     calculate_price_relative_to_52week_high,
     calculate_revenue_growth_yoy,
     find_relative_strength_percentile,
-    find_top_competitors,
 )
-from tools.sentiment_tool import analyze_sentiment, get_news_content
+from tools.sentiment_tool import analyze_sentiment
 from tools.technical_analysis_tools import TechnicalAnalysisTool, get_stock_trend
-from tools.yfinance_tool import load_ticker_data
+from tools.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +120,7 @@ class CanslimReportGenerator:
             return report_filename
 
         except Exception as e:
-            logger.error(f"Failed to generate CANSLIM report for {ticker}: {e}")
-            traceback.print_exc()
+            logger.error(f"Failed to generate CANSLIM report for {ticker}: {e}", exc_info=True)
             raise  # Re-raise the exception to be caught by the UI
         finally:
             # 4. Clean up temporary chart files
@@ -146,7 +144,7 @@ class CanslimReportGenerator:
         """
         db = next(get_db())
         try:
-            result = load_ticker_data(ticker, refresh=False)
+            result = DataManager().load_ticker_data(ticker, refresh=True, price_only=False)
             if isinstance(result, dict) and "error" in result:
                 raise ValueError(result['error'])
 
@@ -201,7 +199,7 @@ class CanslimReportGenerator:
         metrics, company_info = self._calculate_metrics(ticker)
         results = {ticker: {"metrics": metrics, "company_info": company_info}}
         try:
-            competitors = find_top_competitors(ticker)
+            competitors = DataManager().find_top_competitors(ticker)
             if competitors:
                 results["competitors"] = competitors
                 for competitor in competitors:
@@ -316,7 +314,7 @@ class CanslimReportGenerator:
     def _generate_llm_summary(self, ticker: str, company_info: Dict, metrics: Dict, metrics_md: str, industry_analysis_summary: str) -> str:
         """Generates the main CANSLIM summary using the language model."""
         try:
-            company_news = get_news_content(ticker)
+            company_news = DataManager().get_news_content(ticker)
             company_news_str = "Recent news not available."
             if isinstance(company_news, list):
                 news_items = [f"- {n['title']}" for n in company_news[:5] if isinstance(n, dict) and 'title' in n]
@@ -413,7 +411,7 @@ class CanslimReportGenerator:
                 logger.error(f"Could not generate charts for {ticker}: {error_msg}")
                 report_parts.append("_(Could not generate technical charts.)_\n")
         except Exception as e:
-            logger.error(f"Error generating charts for {ticker}: {e}")
+            logger.error(f"Error generating charts for {ticker}: {e}", exc_info=True)
             report_parts.append("_(Error generating technical charts.)_\n")
 
         return "\n".join(report_parts), chart_files

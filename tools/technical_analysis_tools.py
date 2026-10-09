@@ -15,11 +15,9 @@ from langchain_core.prompts import PromptTemplate
 import numpy as np
 import logging
 
-from core.db import get_db
-from core.model import Company, PriceHistory
 from tools.charting_tool import ChartingTool
 from tools.file_wrapper import generate_filename
-from tools.yfinance_tool import load_ticker_data
+from tools.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,27 +34,12 @@ def get_stock_trend(stock_symbol: str = "SPY") -> Union[str, dict]:
         A string indicating the trend ("Bullish", "Bearish", "Neutral")
         or a dictionary with an "error" key if an issue occurs.
     """
-    db = next(get_db())
     try:
-        price_history_query = db.query(PriceHistory.adjclose, PriceHistory.date).filter(
-            PriceHistory.company_id == db.query(Company.id).filter(Company.symbol == stock_symbol).scalar_subquery()
-        ).order_by(PriceHistory.date.desc()).limit(500).all()
-
-        if not price_history_query:
-            result = load_ticker_data(stock_symbol)
-            if isinstance(result, dict) and "error" in result:
-                raise ValueError(result)
-            price_history_query = db.query(PriceHistory.adjclose, PriceHistory.date).filter(
-                PriceHistory.company_id == db.query(Company.id).filter(Company.symbol == stock_symbol).scalar_subquery()
-            ).order_by(PriceHistory.date.desc()).limit(500).all()
-            if not price_history_query:
-                return {"error": f"No price data found for {stock_symbol} even after attempting to load."}
-
-        stock_df = pd.DataFrame([{"adjclose": p[0], "date": p[1]} for p in price_history_query])
-        stock_df['date'] = pd.to_datetime(stock_df['date'])
-        stock_df.set_index('date', inplace=True)
-        stock_df.sort_index(inplace=True) # Ensure data is sorted by date
-
+        price_history = DataManager().load_price_data(stock_symbol)
+        if "error" in price_history or price_history["shareprices"].empty:
+            return None
+        
+        stock_df = price_history["shareprices"]
         if len(stock_df) < 200:
             return {"error": f"Not enough data for {stock_symbol} to calculate 200-day SMA."}
 
@@ -87,8 +70,6 @@ def get_stock_trend(stock_symbol: str = "SPY") -> Union[str, dict]:
     except Exception as e:
         logger.error(f"Error in Stock Trend ({stock_symbol}) analysis: {e}", exc_info=True)
         return {"error": f"Error in Stock Trend ({stock_symbol}) analysis: {e}"}
-    finally:
-        db.close()
  
 
 class TechnicalAnalysisTool:
@@ -118,13 +99,16 @@ class TechnicalAnalysisTool:
             A DataFrame containing the technical indicators, or a dictionary containing an error message if a problem occurs.
         """
         try:
-            # Ensure the index is a DatetimeIndex
-            if not isinstance(price_history_data.index, pd.DatetimeIndex):
-                price_history_data.index = pd.to_datetime(price_history_data.index)
             timeframes = {
                 "daily": price_history_data,
-                "weekly": price_history_data.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Adj Close': 'last', 'Volume': 'sum'}),
-                "monthly": price_history_data.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Adj Close': 'last', 'Volume': 'sum'}),
+                # Use 'closed=right' and 'label=right' to ensure the latest 
+                # timestamp (e.g. 2026-09-18) falls into the correct current bucket.
+                "weekly": price_history_data.resample('W', closed='right', label='right').agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Adj Close': 'last', 'Volume': 'sum'
+                }),
+                "monthly": price_history_data.resample('ME', closed='right', label='right').agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Adj Close': 'last', 'Volume': 'sum'
+                }),
             }
 
             results = {}
@@ -136,7 +120,7 @@ class TechnicalAnalysisTool:
                 if isinstance(df_with_indicators, dict) and 'error' in df_with_indicators:
                     return df_with_indicators # Propagate error
 
-                df_with_indicators.dropna(inplace=True) # Remove rows with NaN indicator values
+                df_with_indicators.dropna(inplace=True)
                 results[timeframe] = df_with_indicators.iloc[-600:].reset_index().to_dict('records') # to json
 
             return results
@@ -155,38 +139,17 @@ class TechnicalAnalysisTool:
             A dictionary containing the calculated technical indicators for daily, weekly,
             and monthly timeframes, or a dictionary with an "error" key.
         """
-        db = next(get_db())  # Get database session
         try:
-            company = db.query(Company).filter(Company.symbol == ticker).first()
-            if not company:
-                return None
-                
-            price_history = db.query(PriceHistory).filter(PriceHistory.company_id == company.id).all()
-            if not price_history:
+            price_history = DataManager().load_price_data(ticker)
+            if "error" in price_history or price_history["shareprices"].empty:
                 return None
             
-            price_history_data = [
-                {
-                    "Date": item.date,
-                    "Open": item.open,
-                    "High": item.high,
-                    "Low": item.low,
-                    "Close": item.close,
-                    "Adj Close": item.adjclose,
-                    "Volume": item.volume,
-                }
-                for item in price_history
-            ]
-            df = pd.DataFrame(price_history_data)
-            df.set_index("Date", inplace=True)
-
+            df = price_history["shareprices"].rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "adjclose": "Adj Close", "volume": "Volume"})
             results = self.calculate_technical_indicators(df)
             return results
         except Exception as e:
             logger.error(f"An unexpected error occurred in calculate_technical_indicators_from_db: {e}", exc_info=True)
             return {"error": f"An unexpected error occurred: {str(e)}"}
-        finally:
-            db.close() # close db session
 
     def summarize_technical_data(self, df: pd.DataFrame, timeframe: str = "daily"):
         """

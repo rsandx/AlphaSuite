@@ -10,6 +10,8 @@ import yfinance as yf
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+from tools.data_manager import DataManager
+
 logger = logging.getLogger(__name__)
 
 def _clean_text(text: str) -> str:
@@ -17,27 +19,6 @@ def _clean_text(text: str) -> str:
     text = re.sub(r"[#|@]\S+", "", text)
     text = text.strip()
     return text
-
-def get_news_content(ticker: str) -> str:
-    try:
-        ticker_object = yf.Ticker(ticker)
-        news_items = ticker_object.news
-        text = ""
-        for item in news_items:
-            content = item["content"] if item.get("content") else item
-            if "pubDate" in content: 
-                text += f"{content.get('pubDate')}: "
-            if "title" in content: # News articles
-                text += f"{content.get('title', '')}. {content.get('description', '')}. {content.get('summary', '')}\n"
-            elif "text" in content: # Tweets
-                text += f"{content.get('text', '')}\n"
-            else:
-                logger.warning(f"Could not extract text from news item: {item}")
-
-        text_clean = _clean_text(text)
-        return text_clean
-    except Exception as e:
-        return {"error": str(e)}
 
 def analyze_sentiment(ticker: str) -> Dict:
     """
@@ -49,7 +30,7 @@ def analyze_sentiment(ticker: str) -> Dict:
     Returns:
         A dictionary containing the sentiment analysis results.
     """
-    news_content = get_news_content(ticker)
+    news_content = DataManager().get_news_content(ticker)
     if isinstance(news_content, dict) and "error" in news_content:
         return {"sentiment": "neutral", "polarity": 0, "subjectivity": 0, "message": f"Could not fetch news: {news_content['error']}"}
     if not news_content:

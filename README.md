@@ -20,12 +20,6 @@ AlphaSuite is an open-source quantitative analysis platform that gives you the p
     *   **AI-Powered Stock Reports**: Generate in-depth fundamental and technical analysis reports for any stock using LLMs.
     *   **AI News Intelligence**: Get AI-generated market briefings and risk analysis based on the latest financial news.
 
-## 🌐 Live Demo
-
-**Check out the live dashboard application here: [https://alphasuite.aitransformer.net](https://alphasuite.aitransformer.net)**
-
-> **Note:** The live demo runs on a free-tier service. To prevent high costs and long loading times, data loading and AI-powered features are disabled. For full functionality and the best performance, it's recommended to run the application locally.
-
 ## 🖼️ Screenshots
 
 Here's a glimpse of what you can do with AlphaSuite.
@@ -89,20 +83,33 @@ Check out these articles to see how AlphaSuite can be used to develop and test s
 *   **Web Framework**: Streamlit
 *   **Backtesting Engine**: [pybroker](https://github.com/edtechre/pybroker)
 *   **Data Analysis**: Pandas, NumPy, SciPy
-*   **Financial Data**: yfinance, TA-Lib
+*   **Financial Data**: yfinance, EODHD Financial Data API, TA-Lib
 *   **Database**: PostgreSQL with SQLAlchemy
 *   **AI/LLM**: LangChain, Google Gemini, Ollama
+
+## 🔌 Data Provider Architecture & Extended Support
+
+AlphaSuite now features a modular, provider-agnostic data integration pipeline. Historically built on `yfinance`, the platform has been refactored around a unified `DataProviderFactory` pattern and standardized SQLAlchemy entities (`Company`, `Financials`, `AnalystEstimates`, `InsiderRoster`, `Holdings`, `UpgradeDowngrade`). 
+
+This architecture decoupling allows developers to plug in custom or commercial data sources without altering downstream strategy logic, backtest engines, or database models.
+
+### Supported Providers Out-of-the-Box:
+1. **`yfinance` (Default)**: Free, open-source integration for quick setups and basic market backtesting.
+2. **[EODHD Financial Data](https://eodhd.com/)** *(Recommended)*: Institutional-grade global coverage including real-time, historical, and end-of-day prices, extended fundamentals with analyst sentiment/estimates, insider rosters, and institutional holdings, etc.
+
+> **Get Started with Institutional Data:**
+> To enable institutional-grade historical data and deep fundamental coverage, sign up via our partner link: **[EODHD Financial Data API](https://eodhd.com/?via=alpha_suite&utm_source=github&utm_medium=lib&utm_campaign=alpha_suite&utm_content=richard_shu)** and configure your `EODHD_API_KEY` in `.env`.
 
 ## 📂 Project Structure
 
 The project is organized into several key directories:
 
-*   `core/`: Contains the core application logic, including database setup (`db.py`), model definitions (`model.py`), and logging configuration.
+*   `core/`: Contains the core application logic, including database setup (`db.py`), model definitions (`model.py`), data providers, and logging configuration.
 *   `pages/`: Each file in this directory corresponds to a page in the Streamlit web UI.
 *   `pybroker_trainer/`: Holds the machine learning pipeline for training and tuning trading models with `pybroker`.
 *   `strategies/`: Contains the definitions for different trading strategies. New strategies can be added here.
 *   `scanners/`: Contains the definitions for custom market scanners. New scanners can be added here.
-*   `tools/`: Includes various utility modules for tasks like financial calculations, data scanning, and interacting with the `yfinance` API.
+*   `tools/`: Includes various utility modules for tasks like financial calculations, data scanning, and interacting with the financial data providers API.
 *   `Home.py`: The main entry point for the Streamlit application.
 *   `download_data.py`: The command-line interface for all data management tasks.
 *   `quant_engine.py`: The core quantitative engine for backtesting and analysis.

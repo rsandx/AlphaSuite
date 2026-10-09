@@ -11,7 +11,7 @@ import logging
 import pandas as pd
 import numpy as np
 
-from tools.yfinance_tool import load_ticker_data, get_benchmark_ticker_for_asset
+from tools.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +39,12 @@ class SeasonalityAnalysisTool:
         Loads price data and enriches it with calendar-based features.
         """
         logger.info(f"Loading and preparing data for {self.ticker}...")
-        data_dict = load_ticker_data(self.ticker, self.start_date, self.end_date)
+        data_dict = DataManager().load_price_data(self.ticker, self.start_date, self.end_date)
         if not data_dict or 'shareprices' not in data_dict or data_dict['shareprices'].empty:
             raise ValueError(f"Could not load price data for {self.ticker}.")
 
-        df = data_dict['shareprices'][['Adj Close']].copy()
-        df.rename(columns={'Adj Close': 'price'}, inplace=True)
+        df = data_dict['shareprices'][['adjclose']].copy()
+        df.rename(columns={'adjclose': 'price'}, inplace=True)
 
         # Ensure the index is a DatetimeIndex before accessing date properties
         df.index = pd.to_datetime(df.index)
@@ -242,7 +242,7 @@ class SeasonalityAnalysisTool:
         logger.info(f"Analyzing sector comparison for {self.ticker}...")
         
         # 1. Get the sector benchmark ETF for the current ticker
-        primary_benchmark, _ = get_benchmark_ticker_for_asset(self.ticker)
+        primary_benchmark, _ = DataManager().get_benchmark_ticker_for_asset(self.ticker)
         if primary_benchmark == '^SPX': # Default if no specific sector found
             logger.warning(f"No specific sector ETF found for {self.ticker}. Skipping sector comparison.")
             return pd.DataFrame()
