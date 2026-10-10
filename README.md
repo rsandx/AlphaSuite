@@ -83,7 +83,7 @@ Check out these articles to see how AlphaSuite can be used to develop and test s
 *   **Web Framework**: Streamlit
 *   **Backtesting Engine**: [pybroker](https://github.com/edtechre/pybroker)
 *   **Data Analysis**: Pandas, NumPy, SciPy
-*   **Financial Data**: yfinance, EODHD Financial Data API, TA-Lib
+*   **Financial Data**: yfinance, EODHD APIs, TA-Lib
 *   **Database**: PostgreSQL with SQLAlchemy
 *   **AI/LLM**: LangChain, Google Gemini, Ollama
 
