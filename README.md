@@ -95,10 +95,10 @@ This architecture decoupling allows developers to plug in custom or commercial d
 
 ### Supported Providers Out-of-the-Box:
 1. **`yfinance` (Default)**: Free, open-source integration for quick setups and basic market backtesting.
-2. **[EODHD Financial Data](https://eodhd.com/)** *(Recommended)*: Institutional-grade global coverage including real-time, historical, and end-of-day prices, extended fundamentals with analyst sentiment/estimates, insider rosters, and institutional holdings, etc.
+2. **[EODHD APIs](https://eodhd.com/)** *(Recommended)*: Institutional-grade global coverage including real-time, historical, and end-of-day prices, extended fundamentals with analyst sentiment/estimates, insider rosters, and institutional holdings, etc.
 
 > **Get Started with Institutional Data:**
-> To enable institutional-grade historical data and deep fundamental coverage, sign up via our partner link: **[EODHD Financial Data API](https://eodhd.com/?via=alpha_suite&utm_source=github&utm_medium=lib&utm_campaign=alpha_suite&utm_content=richard_shu)** and configure your `EODHD_API_KEY` in `.env`.
+> To enable institutional-grade historical data and deep fundamental coverage, sign up via our partner link: **[EODHD APIs](https://eodhd.com/?via=alpha_suite&utm_source=github&utm_medium=lib&utm_campaign=alpha_suite&utm_content=richard_shu)** and configure your `EODHD_API_KEY` in `.env`.
 
 ## 📂 Project Structure
 
